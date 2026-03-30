@@ -2,6 +2,6 @@
   "name": "g20-proxy",
   "version": "1.0.0",
   "engines": {
-    "node": "18.x" 
+    "node": "18.x"
   }
 }

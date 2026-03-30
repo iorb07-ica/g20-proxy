@@ -1,9 +1,6 @@
 {
   "name": "g20-proxy",
   "version": "1.0.0",
-  "dependencies": {
-    "yahoo-finance2": "^2.11.3"
-  },
   "engines": {
     "node": "18.x"
   }

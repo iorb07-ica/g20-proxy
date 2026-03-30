@@ -1,0 +1,12 @@
+{
+  "name": "g20-proxy",
+  "version": "1.0.0",
+  "description": "Proxy serverless para cotações e dividendos G20 Masterclass",
+  "main": "api/index.js",
+  "scripts": {
+    "dev": "node api/index.js"
+  },
+  "dependencies": {
+    "yahoo-finance2": "^2.11.3"
+  }
+}

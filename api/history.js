@@ -1,10 +1,10 @@
-// Proxy para Yahoo Finance — histórico anual para cálculo de variações
-// GET /api/history?symbol=AAPL,MSFT,NVDA
-// Retorna preços de fechamento para calcular: semana, 30d, 3m, 6m, YTD
+// Proxy para Yahoo Finance — histórico para cálculo de variações
+// GET /api/history?symbol=AAPL,MSFT,NVDA,PETR4.SA
+// Retorna preços de fechamento para: 1W, 1M, 3M, 6M, YTD, 5Y
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Cache-Control', 's-maxage=3600'); // cache 1h — histórico não muda muito
+  res.setHeader('Cache-Control', 's-maxage=3600'); // cache 1h
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { symbol } = req.query;
@@ -15,8 +15,8 @@ module.exports = async (req, res) => {
 
   await Promise.all(symbols.map(async (sym) => {
     try {
-      // Pede 1 ano de histórico diário
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1y`;
+      // Pede 5 anos de histórico diário — cobre todos os períodos (1W, 1M, 3M, 6M, YTD, 5Y)
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=5y`;
       const r = await fetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -30,44 +30,48 @@ module.exports = async (req, res) => {
       const timestamps = result.timestamp || [];
       const closes = result.indicators?.quote?.[0]?.close || [];
 
-      // Monta array de pontos {date, close}
+      // Monta array de pontos {date, close, dow}
       const points = timestamps.map((ts, i) => ({
         date: new Date(ts * 1000).toISOString().split('T')[0],
         close: closes[i],
-        dow: new Date(ts * 1000).getDay() // dia da semana
+        dow: new Date(ts * 1000).getDay()
       })).filter(p => p.close != null).sort((a, b) => a.date.localeCompare(b.date));
 
       const today = new Date();
 
-      // Função: ponto mais próximo ANTES de uma data alvo
+      // Ponto mais próximo ANTES de uma data alvo
       function closestBefore(targetDate) {
         const target = targetDate.toISOString().split('T')[0];
         const before = points.filter(p => p.date <= target);
         return before[before.length - 1] || null;
       }
 
-      // Última sexta-feira disponível
+      // 1W — última sexta-feira disponível
       const lastFriday = [...points].reverse().find(p => p.dow === 5) || null;
 
-      // 30 dias corridos atrás
+      // 1M — 30 dias corridos atrás
       const d30 = new Date(today); d30.setDate(d30.getDate() - 30);
 
-      // Exatamente 3 meses atrás
+      // 3M — exatamente 3 meses atrás
       const d3m = new Date(today); d3m.setMonth(d3m.getMonth() - 3);
 
-      // Exatamente 6 meses atrás
+      // 6M — exatamente 6 meses atrás
       const d6m = new Date(today); d6m.setMonth(d6m.getMonth() - 6);
 
-      // Último dia útil de dezembro do ano anterior (YTD)
-      const d31dec = new Date(today.getFullYear() - 1, 11, 31);
+      // YTD — último dia útil de dezembro do ano anterior
+      const dYTD = new Date(today.getFullYear() - 1, 11, 31);
+
+      // 5Y — exatamente 5 anos atrás
+      const d5y = new Date(today); d5y.setFullYear(d5y.getFullYear() - 5);
 
       results[sym] = {
-        symbol: sym,
-        refSemana: lastFriday,
-        ref30d:    closestBefore(d30),
-        ref3m:     closestBefore(d3m),
-        ref6m:     closestBefore(d6m),
-        refYTD:    closestBefore(d31dec),
+        symbol:      sym,
+        refSemana:   lastFriday,
+        ref30d:      closestBefore(d30),
+        ref3m:       closestBefore(d3m),
+        ref6m:       closestBefore(d6m),
+        refYTD:      closestBefore(dYTD),
+        ref5y:       closestBefore(d5y),
         totalPoints: points.length
       };
 

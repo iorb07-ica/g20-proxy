@@ -1,85 +1,84 @@
-// Proxy para Yahoo Finance — histórico para cálculo de variações
-// GET /api/history?symbol=AAPL,MSFT,NVDA,PETR4.SA
-// Retorna preços de fechamento para: 1W, 1M, 3M, 6M, YTD, 5Y
-module.exports = async (req, res) => {
+// api/history.js — Vercel Serverless Function
+// Busca histórico diário de ativos US no Yahoo Finance
+// Suporta múltiplos tickers separados por vírgula
+// Uso: /api/history?symbol=AAPL,MSFT,NVDA
+
+export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Cache-Control', 's-maxage=3600'); // cache 1h
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { symbol } = req.query;
-  if (!symbol) return res.status(400).json({ error: 'symbol obrigatorio' });
+  if (!symbol) return res.status(400).json({ error: 'symbol obrigatório' });
 
-  const symbols = symbol.split(',').map(s => s.trim());
-  const results = {};
+  const tickers = symbol.split(',').map(s => s.trim()).filter(Boolean);
+  const now  = Math.floor(Date.now() / 1000);
+  const from = now - 6 * 365 * 86400; // 6 anos — cobre ref5y com folga
 
-  await Promise.all(symbols.map(async (sym) => {
-    try {
-      // Pede 5 anos de histórico diário — cobre todos os períodos (1W, 1M, 3M, 6M, YTD, 5Y)
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=5y`;
-      const r = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'application/json'
-        }
-      });
-      const d = await r.json();
-      const result = d?.chart?.result?.[0];
-      if (!result) throw new Error('sem dados');
+  function closest(hist, targetDate) {
+    const t = targetDate.toISOString().split('T')[0];
+    const candidates = hist.filter(p => p.date <= t);
+    return candidates.length ? candidates[candidates.length - 1] : null;
+  }
 
-      const timestamps = result.timestamp || [];
-      const closes = result.indicators?.quote?.[0]?.close || [];
+  function computeRefs(hist) {
+    const now2  = new Date();
+    const d30   = new Date(now2); d30.setDate(d30.getDate() - 30);
+    const d3m   = new Date(now2); d3m.setMonth(d3m.getMonth() - 3);
+    const d6m   = new Date(now2); d6m.setMonth(d6m.getMonth() - 6);
+    const dYTD  = new Date(now2.getFullYear() - 1, 11, 31);
+    const d5y   = new Date(now2); d5y.setFullYear(d5y.getFullYear() - 5);
+    const lastFri = [...hist].reverse().find(p => p.dow === 5) || null;
+    return {
+      refSemana: lastFri,
+      ref30d:    closest(hist, d30),
+      ref3m:     closest(hist, d3m),
+      ref6m:     closest(hist, d6m),
+      refYTD:    closest(hist, dYTD),
+      ref5y:     closest(hist, d5y),
+    };
+  }
 
-      // Monta array de pontos {date, close, dow}
-      const points = timestamps.map((ts, i) => ({
-        date: new Date(ts * 1000).toISOString().split('T')[0],
-        close: closes[i],
-        dow: new Date(ts * 1000).getDay()
-      })).filter(p => p.close != null).sort((a, b) => a.date.localeCompare(b.date));
-
-      const today = new Date();
-
-      // Ponto mais próximo ANTES de uma data alvo
-      function closestBefore(targetDate) {
-        const target = targetDate.toISOString().split('T')[0];
-        const before = points.filter(p => p.date <= target);
-        return before[before.length - 1] || null;
-      }
-
-      // 1W — última sexta-feira disponível
-      const lastFriday = [...points].reverse().find(p => p.dow === 5) || null;
-
-      // 1M — 30 dias corridos atrás
-      const d30 = new Date(today); d30.setDate(d30.getDate() - 30);
-
-      // 3M — exatamente 3 meses atrás
-      const d3m = new Date(today); d3m.setMonth(d3m.getMonth() - 3);
-
-      // 6M — exatamente 6 meses atrás
-      const d6m = new Date(today); d6m.setMonth(d6m.getMonth() - 6);
-
-      // YTD — último dia útil de dezembro do ano anterior
-      const dYTD = new Date(today.getFullYear() - 1, 11, 31);
-
-      // 5Y — exatamente 5 anos atrás
-      const d5y = new Date(today); d5y.setFullYear(d5y.getFullYear() - 5);
-
-      results[sym] = {
-        symbol:      sym,
-        refSemana:   lastFriday,
-        ref30d:      closestBefore(d30),
-        ref3m:       closestBefore(d3m),
-        ref6m:       closestBefore(d6m),
-        refYTD:      closestBefore(dYTD),
-        ref5y:       closestBefore(d5y),
-        totalPoints: points.length
-      };
-
-    } catch (e) {
-      results[sym] = { symbol: sym, error: e.message };
+  async function fetchHist(ticker) {
+    const urls = [
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${from}&period2=${now}`,
+      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${from}&period2=${now}`,
+    ];
+    for (const url of urls) {
+      try {
+        const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' } });
+        if (!r.ok) continue;
+        const data = await r.json();
+        const result = data?.chart?.result?.[0];
+        if (!result) continue;
+        const tss    = result.timestamp || [];
+        const closes = result.indicators?.quote?.[0]?.close || [];
+        const hist   = [];
+        tss.forEach((ts, i) => {
+          if (closes[i] == null) return;
+          const d = new Date(ts * 1000);
+          hist.push({ date: d.toISOString().split('T')[0], close: closes[i], dow: d.getDay() });
+        });
+        hist.sort((a, b) => a.date.localeCompare(b.date));
+        if (hist.length >= 5) return computeRefs(hist);
+      } catch {}
     }
+    return null;
+  }
+
+  // Se ticker único, retorna objeto simples
+  if (tickers.length === 1) {
+    const refs = await fetchHist(tickers[0]);
+    if (!refs) return res.json({ error: 'sem dados' });
+    return res.json({ symbol: tickers[0], ...refs });
+  }
+
+  // Múltiplos tickers: retorna { AAPL: {...}, MSFT: {...} }
+  const results = {};
+  await Promise.all(tickers.map(async ticker => {
+    const refs = await fetchHist(ticker);
+    if (refs) results[ticker] = refs;
   }));
 
-  if (symbols.length === 1) return res.json(results[symbols[0]]);
   return res.json(results);
-};
+}

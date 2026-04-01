@@ -1,6 +1,6 @@
 // api/history-br.js — Vercel Serverless Function
-// Busca 2 anos de histórico diário de um ativo BR no Yahoo Finance
-// e retorna os refs de período já calculados (refSemana, ref30d, ref3m, ref6m, refYTD, ref5y)
+// Busca histórico diário de ativo BR no Yahoo Finance
+// e retorna os refs de período já calculados
 // Uso: /api/history-br?symbol=VULC3.SA
 
 export default async function handler(req, res) {
@@ -12,7 +12,7 @@ export default async function handler(req, res) {
   if (!symbol) return res.status(400).json({ error: 'symbol obrigatório' });
 
   const now  = Math.floor(Date.now() / 1000);
-  const from = now - 2 * 365 * 86400;
+  const from = now - 6 * 365 * 86400; // 6 anos — cobre o ref5y com folga
   const urls = [
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&period1=${from}&period2=${now}`,
     `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&period1=${from}&period2=${now}`,
@@ -34,7 +34,6 @@ export default async function handler(req, res) {
   const tss    = result.timestamp || [];
   const closes = result.indicators?.quote?.[0]?.close || [];
 
-  // Monta histórico
   const hist = [];
   tss.forEach((ts, i) => {
     if (closes[i] == null) return;
@@ -44,7 +43,6 @@ export default async function handler(req, res) {
   hist.sort((a, b) => a.date.localeCompare(b.date));
   if (hist.length < 5) return res.json({ error: 'histórico insuficiente' });
 
-  // Encontra o ponto mais próximo anterior a uma data alvo
   function closest(targetDate) {
     const t = targetDate.toISOString().split('T')[0];
     const candidates = hist.filter(p => p.date <= t);

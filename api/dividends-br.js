@@ -1,6 +1,6 @@
 // api/dividends-br.js — Vercel Serverless Function
 // Busca dividendos históricos E futuros de ativos BR via Yahoo Finance
-// Uso: /api/dividends-br?symbol=LREN3.SA&from=1609459200
+// Uso: /api/dividends-br?symbol=LREN3.SA&from=2020-01-01
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -10,7 +10,18 @@ export default async function handler(req, res) {
   const { symbol, from } = req.query;
   if (!symbol) return res.status(400).json({ error: 'symbol obrigatório' });
 
-  const period1 = from || Math.floor((Date.now() - 10 * 365 * 86400000) / 1000);
+  // Converte from (YYYY-MM-DD ou timestamp Unix) para Unix timestamp
+  let period1;
+  if (from) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      period1 = Math.floor(new Date(from).getTime() / 1000);
+    } else {
+      period1 = parseInt(from);
+    }
+  } else {
+    period1 = Math.floor((Date.now() - 10 * 365 * 86400000) / 1000);
+  }
+
   // Estende period2 para 1 ano no futuro para pegar dividendos declarados
   const period2 = Math.floor((Date.now() + 365 * 86400000) / 1000);
 

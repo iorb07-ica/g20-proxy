@@ -1,7 +1,7 @@
 // api/history-br.js — Vercel Serverless Function
-// Busca histórico diário de ativo BR no Yahoo Finance
-// e retorna os refs de período já calculados
-// Uso: /api/history-br?symbol=VULC3.SA
+// Busca histórico diário de ativos BR no Yahoo Finance
+// Suporta múltiplos tickers separados por vírgula
+// Uso: /api/history-br?symbol=VALE3.SA,PETR4.SA,LREN3.SA
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -14,6 +14,7 @@ export default async function handler(req, res) {
   const { symbol } = req.query;
   if (!symbol) return res.status(400).json({ error: 'symbol obrigatório' });
 
+  const tickers = symbol.split(',').map(s => s.trim()).filter(Boolean);
   const now  = Math.floor(Date.now() / 1000);
   const from = now - 6 * 365 * 86400;
 
@@ -25,10 +26,34 @@ export default async function handler(req, res) {
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  async function fetchData(attempt = 0) {
+  function closest(hist, targetDate) {
+    const t = targetDate.toISOString().split('T')[0];
+    const candidates = hist.filter(p => p.date <= t);
+    return candidates.length ? candidates[candidates.length - 1] : null;
+  }
+
+  function computeRefs(hist) {
+    const now2 = new Date();
+    const d30  = new Date(now2); d30.setDate(d30.getDate() - 30);
+    const d3m  = new Date(now2); d3m.setMonth(d3m.getMonth() - 3);
+    const d6m  = new Date(now2); d6m.setMonth(d6m.getMonth() - 6);
+    const dYTD = new Date(now2.getFullYear() - 1, 11, 31);
+    const d5y  = new Date(now2); d5y.setFullYear(d5y.getFullYear() - 5);
+    const lastFri = [...hist].reverse().find(p => p.dow === 5) || null;
+    return {
+      refSemana: lastFri,
+      ref30d:    closest(hist, d30),
+      ref3m:     closest(hist, d3m),
+      ref6m:     closest(hist, d6m),
+      refYTD:    closest(hist, dYTD),
+      ref5y:     closest(hist, d5y),
+    };
+  }
+
+  async function fetchHist(ticker, attempt = 0) {
     const urls = [
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&period1=${from}&period2=${now}`,
-      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&period1=${from}&period2=${now}`,
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${from}&period2=${now}`,
+      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${from}&period2=${now}`,
     ];
     for (const url of urls) {
       try {
@@ -36,7 +61,7 @@ export default async function handler(req, res) {
         if (!r.ok) {
           if (r.status === 429 && attempt < 2) {
             await sleep(500 * (attempt + 1));
-            return fetchData(attempt + 1);
+            return fetchHist(ticker, attempt + 1);
           }
           continue;
         }
@@ -52,40 +77,29 @@ export default async function handler(req, res) {
           hist.push({ date: d.toISOString().split('T')[0], close: closes[i], dow: d.getDay() });
         });
         hist.sort((a, b) => a.date.localeCompare(b.date));
-        if (hist.length >= 5) return hist;
+        if (hist.length >= 5) return computeRefs(hist);
       } catch {}
     }
     if (attempt < 2) {
       await sleep(300 * (attempt + 1));
-      return fetchData(attempt + 1);
+      return fetchHist(ticker, attempt + 1);
     }
     return null;
   }
 
-  const hist = await fetchData();
-  if (!hist) return res.json({ error: 'sem dados', symbol });
-
-  function closest(targetDate) {
-    const t = targetDate.toISOString().split('T')[0];
-    const candidates = hist.filter(p => p.date <= t);
-    return candidates.length ? candidates[candidates.length - 1] : null;
+  // Ticker único
+  if (tickers.length === 1) {
+    const refs = await fetchHist(tickers[0]);
+    if (!refs) return res.json({ error: 'sem dados', symbol: tickers[0] });
+    return res.json({ symbol: tickers[0], ...refs });
   }
 
-  const now2 = new Date();
-  const d30  = new Date(now2); d30.setDate(d30.getDate() - 30);
-  const d3m  = new Date(now2); d3m.setMonth(d3m.getMonth() - 3);
-  const d6m  = new Date(now2); d6m.setMonth(d6m.getMonth() - 6);
-  const dYTD = new Date(now2.getFullYear() - 1, 11, 31);
-  const d5y  = new Date(now2); d5y.setFullYear(d5y.getFullYear() - 5);
-  const lastFri = [...hist].reverse().find(p => p.dow === 5) || null;
+  // Múltiplos tickers
+  const results = {};
+  await Promise.all(tickers.map(async ticker => {
+    const refs = await fetchHist(ticker);
+    if (refs) results[ticker] = refs;
+  }));
 
-  return res.json({
-    symbol,
-    refSemana: lastFri,
-    ref30d:    closest(d30),
-    ref3m:     closest(d3m),
-    ref6m:     closest(d6m),
-    refYTD:    closest(dYTD),
-    ref5y:     closest(d5y),
-  });
+  return res.json(results);
 }

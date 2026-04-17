@@ -1,26 +1,9 @@
-// /api/dividends-yahoo.js
-// Endpoint que busca dividendos históricos no Yahoo Finance
-//
-// Uso:
-//   /api/dividends-yahoo?symbol=AAPL&from=2017-01-01&to=2024-04-01
-//
-// Retorno (mesmo formato do /api/dividends do Polygon):
-// {
-//   "dividends": [
-//     {
-//       "date": "2017-02-09",        // ex-date (Yahoo só tem esta)
-//       "ex_date": "2017-02-09",
-//       "payment_date": "2017-02-09", // Yahoo não tem payment_date separado
-//       "amount": 0.57,
-//       "value": 0.57,
-//       "type": "Dividendo",
-//       "source": "Yahoo"
-//     },
-//     ...
-//   ]
-// }
+// api/dividends-yahoo.js — Vercel Serverless Function
+// Busca dividendos históricos US via Yahoo Finance (endpoint público undocumented)
+// Usado para preencher lacunas que o Polygon grátis (2 anos) não cobre
+// Uso: /api/dividends-yahoo?symbol=AAPL&from=2017-01-01&to=2024-04-01
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   // CORS liberado pra chamadas do browser
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -41,7 +24,7 @@ export default async function handler(req, res) {
     const hoje = Math.floor(Date.now() / 1000);
     const umAnoEmSegundos = 365 * 24 * 60 * 60;
 
-    // Default: últimos 30 anos até hoje (mais que suficiente)
+    // Default: últimos 30 anos até hoje
     const period1 = from
       ? Math.floor(new Date(from).getTime() / 1000)
       : hoje - (30 * umAnoEmSegundos);
@@ -51,14 +34,11 @@ export default async function handler(req, res) {
       : hoje;
 
     // Endpoint "undocumented" mas estável do Yahoo Finance
-    // events=div pede só eventos de dividendo
-    // interval=1d retorna dados diários (precisa estar presente, embora não usemos os preços)
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}` +
                 `?period1=${period1}&period2=${period2}&interval=1d&events=div`;
 
     const response = await fetch(url, {
       headers: {
-        // User-Agent real pra evitar bloqueio
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json,text/plain,*/*',
         'Accept-Language': 'en-US,en;q=0.9'
@@ -76,11 +56,10 @@ export default async function handler(req, res) {
 
     // Estrutura do Yahoo:
     // data.chart.result[0].events.dividends = { "1487635200": { amount: 0.57, date: 1487635200 }, ... }
-    const result = data?.chart?.result?.[0];
-    const dividendsObj = result?.events?.dividends;
+    const result = data && data.chart && data.chart.result && data.chart.result[0];
+    const dividendsObj = result && result.events && result.events.dividends;
 
     if (!dividendsObj) {
-      // Sem dividendos no período — não é erro, apenas vazio
       return res.status(200).json({
         dividends: [],
         symbol: symbol,
@@ -90,25 +69,27 @@ export default async function handler(req, res) {
     }
 
     // Converte objeto do Yahoo em array normalizado
-    const dividends = Object.values(dividendsObj).map(div => {
+    const dividends = Object.values(dividendsObj).map(function(div) {
       const dataStr = new Date(div.date * 1000).toISOString().split('T')[0];
       const amount = parseFloat(div.amount) || 0;
 
       return {
         date: dataStr,
         ex_date: dataStr,
-        payment_date: dataStr, // Yahoo não separa, usa a mesma data
+        payment_date: dataStr,
         record_date: dataStr,
         amount: amount,
         value: amount,
         type: 'Dividendo',
-        frequency: 4, // Yahoo não diz, assume trimestral (maioria US)
+        frequency: 4,
         source: 'Yahoo'
       };
     });
 
     // Ordena por data crescente
-    dividends.sort((a, b) => a.date.localeCompare(b.date));
+    dividends.sort(function(a, b) {
+      return a.date.localeCompare(b.date);
+    });
 
     return res.status(200).json({
       dividends: dividends,
@@ -128,4 +109,4 @@ export default async function handler(req, res) {
       dividends: []
     });
   }
-}
+};

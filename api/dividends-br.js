@@ -1,7 +1,7 @@
 // api/dividends-br.js — Vercel Serverless Function
 // Busca dividendos BR via B3 direto (gratuito, oficial)
-// Fallback: sem Yahoo — B3 é a fonte definitiva
 // Uso: /api/dividends-br?symbol=HGLG11.SA&from=2020-01-01
+// Debug: adicionar &debug=1 para ver detalhes do erro
 
 const CACHE_TTL = 86400; // 24 horas
 
@@ -47,25 +47,34 @@ export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  let { symbol, from } = req.query;
+  let { symbol, from, debug } = req.query;
+  const isDebug = debug === '1' || debug === 'true';
+  const debugInfo = { steps: [] };
+
   if (!symbol) return res.status(400).json({ error: 'symbol obrigatório' });
 
   symbol = symbol.replace(/\.SA$/i, '').toUpperCase();
+  debugInfo.symbol = symbol;
 
   const fromDate = from
     ? (/^\d{4}-\d{2}-\d{2}$/.test(from) ? from : new Date(parseInt(from) * 1000).toISOString().split('T')[0])
     : new Date(Date.now() - 10 * 365 * 86400000).toISOString().split('T')[0];
+  debugInfo.fromDate = fromDate;
 
   const redisUrl   = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
   const cacheKey   = `dividends-br:${symbol}`;
+  debugInfo.hasRedis = !!(redisUrl && redisToken);
 
   // ── Cache Upstash ──
   if (redisUrl && redisToken) {
     const cached = await redisGet(redisUrl, redisToken, cacheKey);
     if (cached) {
+      debugInfo.steps.push('cache hit: ' + cached.length + ' registros');
+      if (isDebug) return res.json({ _debug: debugInfo, data: cached.filter(d => d.payment_date >= fromDate) });
       return res.json(cached.filter(d => d.payment_date >= fromDate));
     }
+    debugInfo.steps.push('cache miss');
   }
 
   // ── B3 direto ──
@@ -76,6 +85,12 @@ export default async function handler(req, res) {
     const b64        = Buffer.from(params).toString('base64');
     const b3Url      = `https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetListedSupplementFunds/${b64}`;
 
+    debugInfo.b3Url = b3Url;
+    debugInfo.typeFund = typeFund;
+    debugInfo.identifier = identifier;
+    debugInfo.steps.push('calling B3...');
+
+    const startTime = Date.now();
     const r = await fetch(b3Url, {
       headers: {
         'User-Agent': 'Mozilla/5.0',
@@ -84,12 +99,35 @@ export default async function handler(req, res) {
         'Origin': 'https://www.b3.com.br'
       }
     });
+    debugInfo.b3Duration = Date.now() - startTime + 'ms';
+    debugInfo.b3Status = r.status;
+    debugInfo.b3StatusText = r.statusText;
 
-    if (!r.ok) throw new Error('B3 HTTP ' + r.status);
+    if (!r.ok) {
+      const errBody = await r.text().catch(() => '');
+      debugInfo.b3ErrorBody = errBody.slice(0, 500);
+      throw new Error('B3 HTTP ' + r.status + ': ' + errBody.slice(0, 200));
+    }
 
-    const data = await r.json();
+    const rawText = await r.text();
+    debugInfo.b3ResponseSize = rawText.length;
+    debugInfo.b3ResponseSample = rawText.slice(0, 300);
+
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (e) {
+      throw new Error('B3 retornou JSON invalido: ' + e.message);
+    }
+
+    debugInfo.b3DataKeys = Object.keys(data || {});
     const cashDividends = data.cashDividends || [];
-    if (!cashDividends.length) throw new Error('sem dados B3');
+    debugInfo.cashDividendsCount = cashDividends.length;
+
+    if (!cashDividends.length) {
+      debugInfo.steps.push('B3 retornou 0 dividendos');
+      throw new Error('sem dados B3');
+    }
 
     const dividends = cashDividends
       .map(d => {
@@ -102,7 +140,7 @@ export default async function handler(req, res) {
         let tipo = 'Dividendo';
         if (tipoRaw.includes('JCP') || tipoRaw.includes('JUROS')) tipo = 'JCP';
         else if (tipoRaw.includes('REND')) tipo = 'Rendimento';
-        else if (tipoRaw.includes('BONIF')) tipo = 'Bonificação';
+        else if (tipoRaw.includes('BONIF')) tipo = 'Bonificacao';
 
         return {
           payment_date: payDate,
@@ -117,15 +155,26 @@ export default async function handler(req, res) {
       .filter(Boolean)
       .sort((a, b) => b.payment_date.localeCompare(a.payment_date));
 
+    debugInfo.dividendsCount = dividends.length;
+    debugInfo.steps.push('success: ' + dividends.length + ' dividendos processados');
+
     // Cache
     if (redisUrl && redisToken && dividends.length > 0) {
       await redisSet(redisUrl, redisToken, cacheKey, dividends);
     }
 
-    return res.json(dividends.filter(d => d.payment_date >= fromDate));
+    const filtered = dividends.filter(d => d.payment_date >= fromDate);
+    debugInfo.afterFilter = filtered.length;
+
+    if (isDebug) return res.json({ _debug: debugInfo, data: filtered });
+    return res.json(filtered);
 
   } catch (err) {
-    // B3 falhou — retorna vazio (não usa Yahoo)
+    debugInfo.error = err.message;
+    debugInfo.errorStack = err.stack ? err.stack.split('\n').slice(0, 3) : [];
+    debugInfo.steps.push('CATCH: ' + err.message);
+
+    if (isDebug) return res.status(200).json({ _debug: debugInfo, data: [] });
     return res.json([]);
   }
 }

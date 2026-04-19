@@ -7,24 +7,42 @@
 
 const CACHE_TTL = 86400; // 24 horas
 
+// ────────────────────────────────────────────────────
+// Upstash REST API helpers — formato correto
+// ────────────────────────────────────────────────────
 async function redisGet(url, token, key) {
   try {
     const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
       headers: { Authorization: `Bearer ${token}` }
     });
+    if (!r.ok) return null;
     const d = await r.json();
-    return d.result ? JSON.parse(d.result) : null;
-  } catch { return null; }
+    // d.result vem como string (valor salvo) ou null
+    if (!d.result) return null;
+    // Parseia o JSON salvo (que era um array de dividendos)
+    try {
+      return JSON.parse(d.result);
+    } catch {
+      return null;
+    }
+  } catch {
+    return null;
+  }
 }
 
 async function redisSet(url, token, key, value) {
   try {
-    await fetch(`${url}/set/${encodeURIComponent(key)}`, {
+    // Upstash REST: body é o valor DIRETO (não envelopado em objeto)
+    // TTL vai como query param ?EX=segundos
+    const r = await fetch(`${url}/set/${encodeURIComponent(key)}?EX=${CACHE_TTL}`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ value: JSON.stringify(value), ex: CACHE_TTL })
+      headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify(value) // Valor direto como body
     });
-  } catch {}
+    return r.ok;
+  } catch {
+    return false;
+  }
 }
 
 // Detecta tipo de ativo pelo ticker para escolher a rota correta
@@ -131,19 +149,28 @@ export default async function handler(req, res) {
   const cacheKey   = `provents-si:${symbol}`;
   debugInfo.hasRedis = !!(redisUrl && redisToken);
 
-  // Cache
+  // ────────────────────────────────────────────────────
+  // Cache LOOKUP
+  // ────────────────────────────────────────────────────
   if (redisUrl && redisToken) {
     const cached = await redisGet(redisUrl, redisToken, cacheKey);
-    if (cached) {
+    if (cached && Array.isArray(cached)) {
       debugInfo.steps.push('cache hit: ' + cached.length + ' registros');
+      res.setHeader('X-Cache-Status', 'HIT');
+      res.setHeader('X-Cache-Count', String(cached.length));
       const filtered = cached.filter(d => d.payment_date >= fromDate);
       if (isDebug) return res.json({ _debug: debugInfo, data: filtered });
       return res.json(filtered);
     }
     debugInfo.steps.push('cache miss');
+    res.setHeader('X-Cache-Status', 'MISS');
+  } else {
+    res.setHeader('X-Cache-Status', 'DISABLED');
   }
 
-  // Statusinvest
+  // ────────────────────────────────────────────────────
+  // Statusinvest fetch
+  // ────────────────────────────────────────────────────
   try {
     debugInfo.steps.push('calling Statusinvest...');
     let rawList = await fetchStatusinvest(symbol, assetType, debugInfo);
@@ -196,9 +223,12 @@ export default async function handler(req, res) {
     }
     debugInfo.steps.push('success: ' + dividends.length + ' dividendos processados');
 
-    // Cache
+    // ────────────────────────────────────────────────────
+    // Cache SAVE
+    // ────────────────────────────────────────────────────
     if (redisUrl && redisToken && dividends.length > 0) {
-      await redisSet(redisUrl, redisToken, cacheKey, dividends);
+      const saved = await redisSet(redisUrl, redisToken, cacheKey, dividends);
+      debugInfo.steps.push('cache save: ' + (saved ? 'OK' : 'FAIL'));
     }
 
     const filtered = dividends.filter(d => d.payment_date >= fromDate);

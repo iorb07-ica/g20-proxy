@@ -1,97 +1,118 @@
-// Proxy busca - VERSAO FULL TRACE
-const CACHE_TTL = 2592000;
+// Proxy busca de ativos — Yahoo Finance search
+// GET /api/search?q=apple ou /api/search?q=PETR
+// Cache Redis (Upstash) TTL 30 dias
+// FIX: usa pipeline() + cache-buster pra evitar cache HTTP da CDN do Upstash
 
-module.exports = async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Expose-Headers', 'X-Trace');
-  if (req.method === 'OPTIONS') return res.status(200).end();
+const CACHE_TTL = 2592000; // 30 dias
 
-  const { q } = req.query;
-  if (!q) return res.json({ results: [] });
-
-  const cacheKey = `search:${q.toLowerCase().trim()}`;
+// ──────────────────────────────────────
+// Helpers Redis (Upstash REST API)
+// FIX: adiciona cache-buster + cache:'no-store' pra forçar ida ao Redis real
+// ──────────────────────────────────────
+async function redisGet(key) {
   const url   = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-  const trace = [];
-
-  // Passo 1: tenta GET no Redis
-  trace.push('key=' + cacheKey);
-  trace.push('hasUrl=' + !!url);
-  trace.push('hasToken=' + !!token);
-
-  let redisValue = null;
+  if (!url || !token) return null;
   try {
-    const r = await fetch(`${url}/get/${encodeURIComponent(cacheKey)}`, {
-      headers: { Authorization: `Bearer ${token}` }
+    const cb = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const r = await fetch(`${url}/get/${encodeURIComponent(key)}?_cb=${cb}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store'
     });
-    trace.push('get.status=' + r.status);
-    const rawText = await r.text();
-    trace.push('get.rawLen=' + rawText.length);
-    trace.push('get.raw100=' + rawText.substring(0, 100).replace(/"/g, "'"));
+    const d = await r.json();
+    if (!d || d.result == null) return null;
+    return typeof d.result === 'string' ? JSON.parse(d.result) : d.result;
+  } catch { return null; }
+}
 
-    const d = JSON.parse(rawText);
-    trace.push('get.d.hasResult=' + (d.result != null));
-    trace.push('get.d.resultType=' + (typeof d.result));
-
-    if (d.result != null) {
-      if (typeof d.result === 'string') {
-        redisValue = JSON.parse(d.result);
-      } else {
-        redisValue = d.result;
-      }
-      trace.push('get.parsed=OK');
-    }
-  } catch (e) {
-    trace.push('get.ERROR=' + e.message);
-  }
-
-  // Passo 2: HIT?
-  if (redisValue) {
-    trace.push('HIT');
-    res.setHeader('X-Trace', trace.join(' | ').substring(0, 800));
-    return res.json(redisValue);
-  }
-
-  trace.push('MISS=yahoo');
-
-  // Passo 3: busca Yahoo
-  const yUrl = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0&listsCount=0`;
-  const yR = await fetch(yUrl, {
-    headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-  });
-  const yD = await yR.json();
-  const quotes = yD?.quotes || [];
-  const results = quotes
-    .filter(qq => qq.symbol && qq.quoteType !== 'OPTION' && qq.quoteType !== 'FUTURE')
-    .slice(0, 8)
-    .map(qq => ({
-      symbol: qq.symbol,
-      name: qq.longname || qq.shortname || qq.symbol,
-      exchange: qq.exchange || '',
-      type: qq.quoteType || '',
-      g20tipo: 'Stock'
-    }));
-  const payload = { results };
-
-  // Passo 4: SET no Redis
+async function redisSet(key, value) {
+  const url   = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return false;
   try {
-    const setR = await fetch(`${url}/set/${encodeURIComponent(cacheKey)}?EX=${CACHE_TTL}`, {
+    await fetch(`${url}/set/${encodeURIComponent(key)}?EX=${CACHE_TTL}`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(value),
+      cache: 'no-store'
     });
-    trace.push('set.status=' + setR.status);
-    const setText = await setR.text();
-    trace.push('set.resp=' + setText.substring(0, 50).replace(/"/g, "'"));
-  } catch (e) {
-    trace.push('set.ERROR=' + e.message);
+    return true;
+  } catch { return false; }
+}
+
+function detectTipo(q) {
+  const sym = q.symbol || '';
+  const type = (q.quoteType || '').toUpperCase();
+  const exch = (q.exchange || '').toUpperCase();
+
+  if (type === 'CRYPTOCURRENCY') return 'Cripto';
+  if (type === 'ETF') return 'ETF';
+  if (type === 'MUTUALFUND') return 'ETF';
+
+  if (/\d$/.test(sym) && (exch.includes('SAO') || exch === 'BZ')) {
+    if (sym.endsWith('11')) return 'FII';
+    return 'Acao';
   }
 
-  res.setHeader('X-Trace', trace.join(' | ').substring(0, 800));
-  return res.json(payload);
+  const reits = ['O','SPG','VNQ','NNN','STAG','WPC','VICI','AMT','PLD','PSA','EXR','AVB','EQR'];
+  if (reits.includes(sym)) return 'REIT';
+
+  if (type === 'EQUITY') return 'Stock';
+
+  return 'Stock';
+}
+
+module.exports = async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count');
+  res.setHeader('Cache-Control', 's-maxage=3600');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  const { q } = req.query;
+  if (!q || q.length < 1) return res.json({ results: [] });
+
+  const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const cacheKey = `search:${q.toLowerCase().trim()}`;
+
+  // Tenta cache primeiro
+  const cached = await redisGet(cacheKey);
+  if (cached) {
+    res.setHeader('X-Cache-Status', 'HIT');
+    return res.json(cached);
+  }
+
+  try {
+    const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0&listsCount=0`;
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+      }
+    });
+    const d = await r.json();
+    const quotes = d?.quotes || [];
+
+    const results = quotes
+      .filter(q => q.symbol && q.quoteType !== 'OPTION' && q.quoteType !== 'FUTURE')
+      .slice(0, 8)
+      .map(q => ({
+        symbol:   q.symbol,
+        name:     q.longname || q.shortname || q.symbol,
+        exchange: q.exchange || '',
+        type:     q.quoteType || '',
+        g20tipo: detectTipo(q)
+      }));
+
+    const payload = { results };
+
+    await redisSet(cacheKey, payload);
+    res.setHeader('X-Cache-Status', redisUrl ? 'MISS' : 'DISABLED');
+    return res.json(payload);
+  } catch (err) {
+    return res.status(500).json({ error: err.message, results: [] });
+  }
 };

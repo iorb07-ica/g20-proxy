@@ -1,89 +1,14 @@
 // Proxy busca de ativos — Yahoo Finance search
 // GET /api/search?q=apple ou /api/search?q=PETR
-// Cache Redis (Upstash) TTL 30 dias
-// FIX: usa pipeline() + cache-buster pra evitar cache HTTP da CDN do Upstash
-
-const CACHE_TTL = 2592000; // 30 dias
-
-// ──────────────────────────────────────
-// Helpers Redis (Upstash REST API)
-// FIX: adiciona cache-buster + cache:'no-store' pra forçar ida ao Redis real
-// ──────────────────────────────────────
-async function redisGet(key) {
-  const url   = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return null;
-  try {
-    const cb = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-    const r = await fetch(`${url}/get/${encodeURIComponent(key)}?_cb=${cb}`, {
-      headers: { Authorization: `Bearer ${token}` },
-      cache: 'no-store'
-    });
-    const d = await r.json();
-    if (!d || d.result == null) return null;
-    return typeof d.result === 'string' ? JSON.parse(d.result) : d.result;
-  } catch { return null; }
-}
-
-async function redisSet(key, value) {
-  const url   = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return false;
-  try {
-    await fetch(`${url}/set/${encodeURIComponent(key)}?EX=${CACHE_TTL}`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(value),
-      cache: 'no-store'
-    });
-    return true;
-  } catch { return false; }
-}
-
-function detectTipo(q) {
-  const sym = q.symbol || '';
-  const type = (q.quoteType || '').toUpperCase();
-  const exch = (q.exchange || '').toUpperCase();
-
-  if (type === 'CRYPTOCURRENCY') return 'Cripto';
-  if (type === 'ETF') return 'ETF';
-  if (type === 'MUTUALFUND') return 'ETF';
-
-  if (/\d$/.test(sym) && (exch.includes('SAO') || exch === 'BZ')) {
-    if (sym.endsWith('11')) return 'FII';
-    return 'Acao';
-  }
-
-  const reits = ['O','SPG','VNQ','NNN','STAG','WPC','VICI','AMT','PLD','PSA','EXR','AVB','EQR'];
-  if (reits.includes(sym)) return 'REIT';
-
-  if (type === 'EQUITY') return 'Stock';
-
-  return 'Stock';
-}
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count');
   res.setHeader('Cache-Control', 's-maxage=3600');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { q } = req.query;
   if (!q || q.length < 1) return res.json({ results: [] });
-
-  const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
-  const cacheKey = `search:${q.toLowerCase().trim()}`;
-
-  // Tenta cache primeiro
-  const cached = await redisGet(cacheKey);
-  if (cached) {
-    res.setHeader('X-Cache-Status', 'HIT');
-    return res.json(cached);
-  }
 
   try {
     const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0&listsCount=0`;
@@ -104,15 +29,37 @@ module.exports = async (req, res) => {
         name:     q.longname || q.shortname || q.symbol,
         exchange: q.exchange || '',
         type:     q.quoteType || '',
+        // Detecta tipo G20
         g20tipo: detectTipo(q)
       }));
 
-    const payload = { results };
-
-    await redisSet(cacheKey, payload);
-    res.setHeader('X-Cache-Status', redisUrl ? 'MISS' : 'DISABLED');
-    return res.json(payload);
+    return res.json({ results });
   } catch (err) {
     return res.status(500).json({ error: err.message, results: [] });
   }
 };
+
+function detectTipo(q) {
+  const sym = q.symbol || '';
+  const type = (q.quoteType || '').toUpperCase();
+  const exch = (q.exchange || '').toUpperCase();
+
+  if (type === 'CRYPTOCURRENCY') return 'Cripto';
+  if (type === 'ETF') return 'ETF';
+  if (type === 'MUTUALFUND') return 'ETF';
+
+  // B3: termina em número
+  if (/\d$/.test(sym) && (exch.includes('SAO') || exch === 'BZ')) {
+    if (sym.endsWith('11')) return 'FII';
+    return 'Acao';
+  }
+
+  // REIT
+  const reits = ['O','SPG','VNQ','NNN','STAG','WPC','VICI','AMT','PLD','PSA','EXR','AVB','EQR'];
+  if (reits.includes(sym)) return 'REIT';
+
+  // Stock US padrão
+  if (type === 'EQUITY') return 'Stock';
+
+  return 'Stock';
+}

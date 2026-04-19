@@ -30,17 +30,41 @@ async function redisGet(url, token, key) {
   }
 }
 
-async function redisSet(url, token, key, value) {
+async function redisSet(url, token, key, value, debugInfo) {
   try {
-    // Upstash REST: body é o valor DIRETO (não envelopado em objeto)
-    // TTL vai como query param ?EX=segundos
-    const r = await fetch(`${url}/set/${encodeURIComponent(key)}?EX=${CACHE_TTL}`, {
+    // Upstash REST Pipeline API — formato 100% garantido para valores grandes
+    // Array de comandos Redis: [["SET", "key", "value", "EX", "86400"]]
+    const serialized = JSON.stringify(value);
+    if (debugInfo) debugInfo.saveSize = serialized.length;
+
+    const r = await fetch(`${url}/pipeline`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: JSON.stringify(value) // Valor direto como body
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify([
+        ['SET', key, serialized, 'EX', String(CACHE_TTL)]
+      ])
     });
-    return r.ok;
-  } catch {
+
+    if (debugInfo) debugInfo.saveStatus = r.status;
+
+    if (!r.ok) {
+      if (debugInfo) {
+        const errText = await r.text().catch(() => '');
+        debugInfo.saveError = errText.slice(0, 300);
+      }
+      return false;
+    }
+
+    const result = await r.json();
+    if (debugInfo) debugInfo.saveResult = JSON.stringify(result).slice(0, 200);
+
+    // Pipeline retorna array de resultados: [{result: "OK"}]
+    return Array.isArray(result) && result[0] && result[0].result === 'OK';
+  } catch (e) {
+    if (debugInfo) debugInfo.saveException = e.message;
     return false;
   }
 }
@@ -227,7 +251,7 @@ export default async function handler(req, res) {
     // Cache SAVE
     // ────────────────────────────────────────────────────
     if (redisUrl && redisToken && dividends.length > 0) {
-      const saved = await redisSet(redisUrl, redisToken, cacheKey, dividends);
+      const saved = await redisSet(redisUrl, redisToken, cacheKey, dividends, debugInfo);
       debugInfo.steps.push('cache save: ' + (saved ? 'OK' : 'FAIL'));
     }
 

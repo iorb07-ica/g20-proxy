@@ -5,24 +5,61 @@
 
 const CACHE_TTL = 86400; // 24 horas
 
+// ────────────────────────────────────────────────────
+// Upstash REST API helpers — formato Pipeline (validado)
+// ────────────────────────────────────────────────────
 async function redisGet(url, token, key) {
   try {
     const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
       headers: { Authorization: `Bearer ${token}` }
     });
+    if (!r.ok) return null;
     const d = await r.json();
-    return d.result ? JSON.parse(d.result) : null;
-  } catch { return null; }
+    if (!d.result) return null;
+    try {
+      return JSON.parse(d.result);
+    } catch {
+      return null;
+    }
+  } catch {
+    return null;
+  }
 }
 
-async function redisSet(url, token, key, value) {
+async function redisSet(url, token, key, value, debugInfo) {
   try {
-    await fetch(`${url}/set/${encodeURIComponent(key)}`, {
+    const serialized = JSON.stringify(value);
+    if (debugInfo) debugInfo.saveSize = serialized.length;
+
+    const r = await fetch(`${url}/pipeline`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ value: JSON.stringify(value), ex: CACHE_TTL })
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify([
+        ['SET', key, serialized, 'EX', String(CACHE_TTL)]
+      ])
     });
-  } catch {}
+
+    if (debugInfo) debugInfo.saveStatus = r.status;
+
+    if (!r.ok) {
+      if (debugInfo) {
+        const errText = await r.text().catch(() => '');
+        debugInfo.saveError = errText.slice(0, 300);
+      }
+      return false;
+    }
+
+    const result = await r.json();
+    if (debugInfo) debugInfo.saveResult = JSON.stringify(result).slice(0, 200);
+
+    return Array.isArray(result) && result[0] && result[0].result === 'OK';
+  } catch (e) {
+    if (debugInfo) debugInfo.saveException = e.message;
+    return false;
+  }
 }
 
 function isFII(ticker) {
@@ -44,6 +81,7 @@ function parseRate(rate) {
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
@@ -66,18 +104,28 @@ export default async function handler(req, res) {
   const cacheKey   = `dividends-br:${symbol}`;
   debugInfo.hasRedis = !!(redisUrl && redisToken);
 
-  // ── Cache Upstash ──
+  // ────────────────────────────────────────────────────
+  // Cache LOOKUP
+  // ────────────────────────────────────────────────────
   if (redisUrl && redisToken) {
     const cached = await redisGet(redisUrl, redisToken, cacheKey);
-    if (cached) {
+    if (cached && Array.isArray(cached)) {
       debugInfo.steps.push('cache hit: ' + cached.length + ' registros');
-      if (isDebug) return res.json({ _debug: debugInfo, data: cached.filter(d => d.payment_date >= fromDate) });
-      return res.json(cached.filter(d => d.payment_date >= fromDate));
+      res.setHeader('X-Cache-Status', 'HIT');
+      res.setHeader('X-Cache-Count', String(cached.length));
+      const filtered = cached.filter(d => d.payment_date >= fromDate);
+      if (isDebug) return res.json({ _debug: debugInfo, data: filtered });
+      return res.json(filtered);
     }
     debugInfo.steps.push('cache miss');
+    res.setHeader('X-Cache-Status', 'MISS');
+  } else {
+    res.setHeader('X-Cache-Status', 'DISABLED');
   }
 
-  // ── B3 direto ──
+  // ────────────────────────────────────────────────────
+  // B3 direto
+  // ────────────────────────────────────────────────────
   try {
     const identifier = symbol.substring(0, 4);
     const typeFund   = isFII(symbol) ? 27 : 3;
@@ -158,9 +206,12 @@ export default async function handler(req, res) {
     debugInfo.dividendsCount = dividends.length;
     debugInfo.steps.push('success: ' + dividends.length + ' dividendos processados');
 
-    // Cache
+    // ────────────────────────────────────────────────────
+    // Cache SAVE
+    // ────────────────────────────────────────────────────
     if (redisUrl && redisToken && dividends.length > 0) {
-      await redisSet(redisUrl, redisToken, cacheKey, dividends);
+      const saved = await redisSet(redisUrl, redisToken, cacheKey, dividends, debugInfo);
+      debugInfo.steps.push('cache save: ' + (saved ? 'OK' : 'FAIL'));
     }
 
     const filtered = dividends.filter(d => d.payment_date >= fromDate);

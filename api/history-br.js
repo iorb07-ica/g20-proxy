@@ -1,8 +1,48 @@
 // api/history-br.js — Vercel Serverless Function
-// Busca histórico diário de ativos BR no Yahoo Finance
-// Suporta múltiplos tickers separados por vírgula
+// Busca historico diario de ativos BR no Yahoo Finance
+// Suporta multiplos tickers separados por virgula
 // Uso: /api/history-br?symbol=VALE3.SA,PETR4.SA,LREN3.SA
+// Cache Redis (Upstash) TTL 1h
 
+const CACHE_TTL = 3600; // 1 hora
+
+// ──────────────────────────────────────
+// Helpers Redis (Upstash REST API)
+// ──────────────────────────────────────
+async function redisGet(key) {
+  const url   = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  try {
+    const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const d = await r.json();
+    if (!d || d.result == null) return null;
+    return JSON.parse(d.result);
+  } catch { return null; }
+}
+
+async function redisSet(key, value) {
+  const url   = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return false;
+  try {
+    await fetch(`${url}/set/${encodeURIComponent(key)}?EX=${CACHE_TTL}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(value)
+    });
+    return true;
+  } catch { return false; }
+}
+
+// ──────────────────────────────────────
+// Handler principal
+// ──────────────────────────────────────
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
@@ -12,11 +52,12 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { symbol } = req.query;
-  if (!symbol) return res.status(400).json({ error: 'symbol obrigatório' });
+  if (!symbol) return res.status(400).json({ error: 'symbol obrigatorio' });
 
-  const tickers = symbol.split(',').map(s => s.trim()).filter(Boolean);
-  const now  = Math.floor(Date.now() / 1000);
-  const from = now - 6 * 365 * 86400;
+  const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const tickers  = symbol.split(',').map(s => s.trim()).filter(Boolean);
+  const now      = Math.floor(Date.now() / 1000);
+  const from     = now - 6 * 365 * 86400;
 
   const HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -50,7 +91,7 @@ export default async function handler(req, res) {
     };
   }
 
-  async function fetchHist(ticker, attempt = 0) {
+  async function fetchHistFromYahoo(ticker, attempt = 0) {
     const urls = [
       `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${from}&period2=${now}`,
       `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${from}&period2=${now}`,
@@ -61,7 +102,7 @@ export default async function handler(req, res) {
         if (!r.ok) {
           if (r.status === 429 && attempt < 2) {
             await sleep(500 * (attempt + 1));
-            return fetchHist(ticker, attempt + 1);
+            return fetchHistFromYahoo(ticker, attempt + 1);
           }
           continue;
         }
@@ -82,24 +123,45 @@ export default async function handler(req, res) {
     }
     if (attempt < 2) {
       await sleep(300 * (attempt + 1));
-      return fetchHist(ticker, attempt + 1);
+      return fetchHistFromYahoo(ticker, attempt + 1);
     }
     return null;
   }
 
-  // Ticker único
-  if (tickers.length === 1) {
-    const refs = await fetchHist(tickers[0]);
-    if (!refs) return res.json({ error: 'sem dados', symbol: tickers[0] });
-    return res.json({ symbol: tickers[0], ...refs });
+  // Funcao com cache
+  async function fetchHistWithCache(ticker) {
+    const cacheKey = `hist:br:${ticker.toUpperCase()}`;
+    const cached = await redisGet(cacheKey);
+    if (cached) return { data: cached, cacheHit: true };
+
+    const data = await fetchHistFromYahoo(ticker);
+    if (data) await redisSet(cacheKey, data);
+    return { data, cacheHit: false };
   }
 
-  // Múltiplos tickers
+  // Ticker unico
+  if (tickers.length === 1) {
+    const { data, cacheHit } = await fetchHistWithCache(tickers[0]);
+    res.setHeader('X-Cache-Status', cacheHit ? 'HIT' : (redisUrl ? 'MISS' : 'DISABLED'));
+    if (!data) return res.json({ error: 'sem dados', symbol: tickers[0] });
+    return res.json({ symbol: tickers[0], ...data });
+  }
+
+  // Multiplos tickers - paralelo
   const results = {};
+  let hits = 0, misses = 0;
+
   await Promise.all(tickers.map(async ticker => {
-    const refs = await fetchHist(ticker);
-    if (refs) results[ticker] = refs;
+    const { data, cacheHit } = await fetchHistWithCache(ticker);
+    if (data) {
+      results[ticker] = data;
+      if (cacheHit) hits++;
+      else misses++;
+    }
   }));
+
+  res.setHeader('X-Cache-Status', hits === tickers.length ? 'HIT' : (hits > 0 ? 'PARTIAL' : (redisUrl ? 'MISS' : 'DISABLED')));
+  res.setHeader('X-Cache-Count', String(hits));
 
   return res.json(results);
 }

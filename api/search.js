@@ -1,120 +1,97 @@
-// Proxy busca de ativos — VERSAO DEBUG
-// Use com ?debug=1 para ver detalhes
-
+// Proxy busca - VERSAO FULL TRACE
 const CACHE_TTL = 2592000;
 
-async function redisGetDebug(key) {
+module.exports = async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Trace');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  const { q } = req.query;
+  if (!q) return res.json({ results: [] });
+
+  const cacheKey = `search:${q.toLowerCase().trim()}`;
   const url   = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return { ok: false, error: 'sem env vars', value: null };
+
+  const trace = [];
+
+  // Passo 1: tenta GET no Redis
+  trace.push('key=' + cacheKey);
+  trace.push('hasUrl=' + !!url);
+  trace.push('hasToken=' + !!token);
+
+  let redisValue = null;
   try {
-    const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
+    const r = await fetch(`${url}/get/${encodeURIComponent(cacheKey)}`, {
       headers: { Authorization: `Bearer ${token}` }
     });
+    trace.push('get.status=' + r.status);
     const rawText = await r.text();
-    let d;
-    try { d = JSON.parse(rawText); } catch (e) {
-      return { ok: false, error: 'raw nao e JSON: ' + rawText.substring(0,200), value: null };
+    trace.push('get.rawLen=' + rawText.length);
+    trace.push('get.raw100=' + rawText.substring(0, 100).replace(/"/g, "'"));
+
+    const d = JSON.parse(rawText);
+    trace.push('get.d.hasResult=' + (d.result != null));
+    trace.push('get.d.resultType=' + (typeof d.result));
+
+    if (d.result != null) {
+      if (typeof d.result === 'string') {
+        redisValue = JSON.parse(d.result);
+      } else {
+        redisValue = d.result;
+      }
+      trace.push('get.parsed=OK');
     }
-
-    if (!d || d.result == null) return { ok: true, error: null, value: null, note: 'd.result is null' };
-
-    const resultType = typeof d.result;
-    const resultPreview = resultType === 'string'
-      ? d.result.substring(0, 100)
-      : JSON.stringify(d.result).substring(0, 100);
-
-    let parsed = null;
-    let parseError = null;
-    try {
-      parsed = typeof d.result === 'string' ? JSON.parse(d.result) : d.result;
-    } catch (e) {
-      parseError = e.message;
-    }
-
-    return {
-      ok: true,
-      error: parseError,
-      value: parsed,
-      resultType,
-      resultPreview,
-      rawLength: rawText.length
-    };
-  } catch (err) {
-    return { ok: false, error: 'fetch failed: ' + err.message, value: null };
+  } catch (e) {
+    trace.push('get.ERROR=' + e.message);
   }
-}
 
-async function redisSetDebug(key, value) {
-  const url   = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return { ok: false, error: 'sem env vars' };
+  // Passo 2: HIT?
+  if (redisValue) {
+    trace.push('HIT');
+    res.setHeader('X-Trace', trace.join(' | ').substring(0, 800));
+    return res.json(redisValue);
+  }
+
+  trace.push('MISS=yahoo');
+
+  // Passo 3: busca Yahoo
+  const yUrl = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0&listsCount=0`;
+  const yR = await fetch(yUrl, {
+    headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+  });
+  const yD = await yR.json();
+  const quotes = yD?.quotes || [];
+  const results = quotes
+    .filter(qq => qq.symbol && qq.quoteType !== 'OPTION' && qq.quoteType !== 'FUTURE')
+    .slice(0, 8)
+    .map(qq => ({
+      symbol: qq.symbol,
+      name: qq.longname || qq.shortname || qq.symbol,
+      exchange: qq.exchange || '',
+      type: qq.quoteType || '',
+      g20tipo: 'Stock'
+    }));
+  const payload = { results };
+
+  // Passo 4: SET no Redis
   try {
-    const r = await fetch(`${url}/set/${encodeURIComponent(key)}?EX=${CACHE_TTL}`, {
+    const setR = await fetch(`${url}/set/${encodeURIComponent(cacheKey)}?EX=${CACHE_TTL}`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(value)
+      body: JSON.stringify(payload)
     });
-    const rawText = await r.text();
-    return { ok: r.ok, status: r.status, response: rawText.substring(0, 200) };
-  } catch (err) {
-    return { ok: false, error: 'fetch failed: ' + err.message };
-  }
-}
-
-module.exports = async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count, X-Debug-Get, X-Debug-Set');
-  if (req.method === 'OPTIONS') return res.status(200).end();
-
-  const { q, debug } = req.query;
-  if (!q) return res.json({ results: [] });
-
-  const cacheKey = `search:${q.toLowerCase().trim()}`;
-
-  if (debug === '1') {
-    const getResult = await redisGetDebug(cacheKey);
-    return res.json({
-      cacheKey,
-      getResult,
-      envVarsPresent: {
-        url: !!process.env.UPSTASH_REDIS_REST_URL,
-        token: !!process.env.UPSTASH_REDIS_REST_TOKEN
-      }
-    });
+    trace.push('set.status=' + setR.status);
+    const setText = await setR.text();
+    trace.push('set.resp=' + setText.substring(0, 50).replace(/"/g, "'"));
+  } catch (e) {
+    trace.push('set.ERROR=' + e.message);
   }
 
-  const getResult = await redisGetDebug(cacheKey);
-  if (getResult.ok && getResult.value) {
-    res.setHeader('X-Cache-Status', 'HIT');
-    return res.json(getResult.value);
-  }
-
-  const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0&listsCount=0`;
-  const r = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-  });
-  const d = await r.json();
-  const quotes = d?.quotes || [];
-  const results = quotes
-    .filter(q => q.symbol && q.quoteType !== 'OPTION' && q.quoteType !== 'FUTURE')
-    .slice(0, 8)
-    .map(q => ({
-      symbol: q.symbol,
-      name: q.longname || q.shortname || q.symbol,
-      exchange: q.exchange || '',
-      type: q.quoteType || '',
-      g20tipo: 'Stock'
-    }));
-  const payload = { results };
-
-  const setResult = await redisSetDebug(cacheKey, payload);
-  res.setHeader('X-Cache-Status', 'MISS');
-  res.setHeader('X-Debug-Get', JSON.stringify(getResult).substring(0, 200));
-  res.setHeader('X-Debug-Set', JSON.stringify(setResult).substring(0, 200));
+  res.setHeader('X-Trace', trace.join(' | ').substring(0, 800));
   return res.json(payload);
 };

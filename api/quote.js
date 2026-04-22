@@ -120,6 +120,9 @@ export default async function handler(req, res) {
             changePercent:              prev ? ((meta.regularMarketPrice - prev) / prev * 100) : 0,
             prevClose:                  prev,
             currency:                   meta.currency || 'USD',
+            // 52 semanas (Yahoo chart API retorna nos meta fields)
+            high52:                     meta.fiftyTwoWeekHigh || null,
+            low52:                      meta.fiftyTwoWeekLow || null,
             dividendRate:               meta.dividendRate || null,
             dividendDate:               meta.dividendDate || null,
             exDividendDate:             meta.exDividendDate || null,
@@ -139,6 +142,9 @@ export default async function handler(req, res) {
             changePercent:              q.regularMarketChangePercent || 0,
             prevClose:                  prev,
             currency:                   q.currency || 'USD',
+            // 52 semanas (Yahoo quote API retorna diretamente no result)
+            high52:                     q.fiftyTwoWeekHigh || null,
+            low52:                      q.fiftyTwoWeekLow || null,
             dividendRate:               q.dividendRate || null,
             dividendDate:               q.dividendDate || null,
             exDividendDate:             q.exDividendDate || null,

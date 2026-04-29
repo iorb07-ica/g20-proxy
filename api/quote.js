@@ -3,11 +3,11 @@
 // Uso: /api/quote?symbol=PETR4.SA ou /api/quote?symbol=AAPL,MSFT
 // Debug: adicionar &debug=1
 //
-// VERSÃO 7 (29/04/26): Adicionado pre-market / after-hours / marketState
-// Campos novos no retorno:
-//   - preMarketPrice, preMarketChangePercent
-//   - postMarketPrice, postMarketChangePercent
-//   - marketState ("PRE" | "REGULAR" | "POST" | "CLOSED" | "PREPRE" | "POSTPOST")
+// VERSÃO 8 (29/04/26): Limpeza após investigação pre/post-market.
+// Yahoo v7/quote retorna 401 sem cookie+crumb (auth) — bloqueado.
+// Yahoo v8/chart NÃO retorna marketState/preMarketPrice/postMarketPrice.
+// Decisão: removidos esses campos. Chip de estado do mercado e futuros US
+// passam a ser calculados/exibidos sem depender desses dados do Yahoo.
 
 const CACHE_TTL = 300; // 5 minutos — cotações mudam frequente, não pode ser 24h
 
@@ -82,7 +82,6 @@ export default async function handler(req, res) {
 
   const symbols = symbol.split(',').map(s => s.trim()).filter(Boolean);
   debugInfo.symbolsCount = symbols.length;
-  debugInfo._VERSION_MARKER = 'V7_DUMP_KEYS_29ABR_0125'; // ← v7: dumpa keys do meta no trace
 
   const redisUrl   = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -96,65 +95,29 @@ export default async function handler(req, res) {
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  async function fetchQuote(sym, attempt = 0, traceLog = null) {
-    // YAHOO V7/QUOTE retorna 401 desde fim de 2023 (precisa cookie+crumb).
-    // Solução: usar v8/chart com includePrePost=true que retorna pre/post nos meta fields.
-    // Mantemos v7 como tentativa pra caso voltem a permitir; v8 com prepost é o real.
+  async function fetchQuote(sym, attempt = 0) {
+    // v8/chart é a única rota grátis confiável.
+    // v7/quote retorna 401 sem cookie+crumb desde fim de 2023.
     const urls = [
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d&includePrePost=true`,
-      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d&includePrePost=true`,
-      `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(sym)}`,
-      `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(sym)}`,
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
+      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
     ];
 
     for (let i = 0; i < urls.length; i++) {
       try {
         const r = await fetch(urls[i], { headers: HEADERS });
-        if (traceLog) traceLog.push(`url[${i}] status=${r.status}`);
         if (!r.ok) {
           if (r.status === 429 && attempt < 2) {
             await sleep(500 * (attempt + 1));
-            return fetchQuote(sym, attempt + 1, traceLog);
+            return fetchQuote(sym, attempt + 1);
           }
           continue;
         }
         const data = await r.json();
 
-        // ────────────────────────────────────────────────
-        // Ramo 1: chart API (v8) — meta fields
-        // ────────────────────────────────────────────────
         const meta = data?.chart?.result?.[0]?.meta;
         if (meta?.regularMarketPrice) {
-          if (traceLog) {
-            traceLog.push(`url[${i}] hit=v8/chart marketState=${meta.marketState||'undef'} hasPre=${!!meta.preMarketPrice} hasPost=${!!meta.postMarketPrice}`);
-            // DEBUG: lista todas as chaves do meta pra ver o que Yahoo está retornando
-            traceLog.push(`url[${i}] meta_keys=${Object.keys(meta).join(',').slice(0,500)}`);
-          }
           const prev = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
-
-          // Cálculo pre/post-market a partir de meta.regularMarketPrice como referência
-          // Yahoo chart API tem: meta.preMarketPrice, meta.postMarketPrice (quando disponível)
-          // mas NEM SEMPRE retorna nessa rota — ramo 2 (quote API) é mais confiável pra isso
-          let preMarketPrice = null, preMarketChangePercent = null;
-          let postMarketPrice = null, postMarketChangePercent = null;
-
-          if (typeof meta.preMarketPrice === 'number' && meta.preMarketPrice > 0) {
-            preMarketPrice = meta.preMarketPrice;
-            // Variação do pre vs. fechamento regular do dia anterior (prev)
-            if (prev && prev > 0) {
-              preMarketChangePercent = ((preMarketPrice - prev) / prev) * 100;
-            }
-          }
-
-          if (typeof meta.postMarketPrice === 'number' && meta.postMarketPrice > 0) {
-            postMarketPrice = meta.postMarketPrice;
-            // Variação do post vs. fechamento regular do DIA (regularMarketPrice)
-            const regular = meta.regularMarketPrice;
-            if (regular && regular > 0) {
-              postMarketChangePercent = ((postMarketPrice - regular) / regular) * 100;
-            }
-          }
-
           return {
             symbol:                     meta.symbol || sym,
             name:                       meta.longName || meta.shortName || sym,
@@ -170,65 +133,15 @@ export default async function handler(req, res) {
             dividendDate:               meta.dividendDate || null,
             exDividendDate:             meta.exDividendDate || null,
             trailingAnnualDividendRate: meta.trailingAnnualDividendRate || null,
-            // ============== NOVOS CAMPOS (v7 — 29/04/26) ==============
-            // Estado do mercado: PRE / REGULAR / POST / CLOSED / PREPRE / POSTPOST
-            marketState:                meta.marketState || null,
-            // Pre-market (antes da abertura)
-            preMarketPrice:             preMarketPrice,
-            preMarketChangePercent:     preMarketChangePercent,
-            // After-hours (depois do fechamento)
-            postMarketPrice:            postMarketPrice,
-            postMarketChangePercent:    postMarketChangePercent,
-            // ============================================================
             timestamp:                  Date.now(),
           };
         }
-
-        // ────────────────────────────────────────────────
-        // Ramo 2: quote API (v7) — fields diretos no result
-        // Yahoo quote API é a MAIS CONFIÁVEL pra pre/post-market
-        // ────────────────────────────────────────────────
-        const q = data?.quoteResponse?.result?.[0];
-        if (q?.regularMarketPrice) {
-          if (traceLog) traceLog.push(`url[${i}] hit=v7/quote marketState=${q.marketState||'undef'} hasPre=${!!q.preMarketPrice} hasPost=${!!q.postMarketPrice}`);
-          const prev = q.regularMarketPreviousClose || q.regularMarketPrice;
-          return {
-            symbol:                     q.symbol || sym,
-            name:                       q.longName || q.shortName || sym,
-            price:                      q.regularMarketPrice,
-            change:                     q.regularMarketChange || (q.regularMarketPrice - prev),
-            changePercent:              q.regularMarketChangePercent || 0,
-            prevClose:                  prev,
-            currency:                   q.currency || 'USD',
-            // 52 semanas (Yahoo quote API retorna diretamente no result)
-            high52:                     q.fiftyTwoWeekHigh || null,
-            low52:                      q.fiftyTwoWeekLow || null,
-            dividendRate:               q.dividendRate || null,
-            dividendDate:               q.dividendDate || null,
-            exDividendDate:             q.exDividendDate || null,
-            trailingAnnualDividendRate: q.trailingAnnualDividendRate || null,
-            // ============== NOVOS CAMPOS (v7 — 29/04/26) ==============
-            // Estado do mercado: PRE / REGULAR / POST / CLOSED / PREPRE / POSTPOST
-            marketState:                q.marketState || null,
-            // Pre-market (antes da abertura) — Yahoo retorna direto
-            preMarketPrice:             (typeof q.preMarketPrice === 'number') ? q.preMarketPrice : null,
-            preMarketChangePercent:     (typeof q.preMarketChangePercent === 'number') ? q.preMarketChangePercent : null,
-            // After-hours (depois do fechamento) — Yahoo retorna direto
-            postMarketPrice:            (typeof q.postMarketPrice === 'number') ? q.postMarketPrice : null,
-            postMarketChangePercent:    (typeof q.postMarketChangePercent === 'number') ? q.postMarketChangePercent : null,
-            // ============================================================
-            timestamp:                  Date.now(),
-          };
-        }
-      } catch (e) {
-        if (traceLog) traceLog.push(`url[${i}] threw=${(e.message||'').slice(0,60)}`);
-      }
+      } catch {}
     }
 
     if (attempt < 2) {
-      if (traceLog) traceLog.push(`retry attempt=${attempt+1}`);
       await sleep(300 * (attempt + 1));
-      return fetchQuote(sym, attempt + 1, traceLog);
+      return fetchQuote(sym, attempt + 1);
     }
 
     return null;
@@ -237,9 +150,9 @@ export default async function handler(req, res) {
   // ────────────────────────────────────────────────────
   // Função que consulta cache ou Yahoo pra UM ticker
   // ────────────────────────────────────────────────────
-  async function getQuoteWithCache(sym, traceOut) {
-    // VERSÃO v7 (29/04/26): adiciona dump de meta_keys pra debug.
-    const cacheKey = `quote:v7:${sym}`;
+  async function getQuoteWithCache(sym) {
+    // VERSÃO v8 (29/04/26): cache key bumpada pra invalidar caches v3-v7 anteriores.
+    const cacheKey = `quote:v8:${sym}`;
 
     // Tenta cache
     if (redisUrl && redisToken) {
@@ -250,7 +163,7 @@ export default async function handler(req, res) {
     }
 
     // Busca Yahoo
-    const q = await fetchQuote(sym, 0, traceOut);
+    const q = await fetchQuote(sym);
     if (!q) return { data: null, cacheHit: false };
 
     // Salva no cache
@@ -265,10 +178,8 @@ export default async function handler(req, res) {
   // 1 símbolo só
   // ────────────────────────────────────────────────────
   if (symbols.length === 1) {
-    const traceOut = isDebug ? [] : null;
-    const { data, cacheHit } = await getQuoteWithCache(symbols[0], traceOut);
+    const { data, cacheHit } = await getQuoteWithCache(symbols[0]);
     debugInfo.steps.push(cacheHit ? 'cache hit' : 'cache miss + yahoo fetch');
-    if (traceOut && traceOut.length) debugInfo.trace = traceOut;
     res.setHeader('X-Cache-Status', cacheHit ? 'HIT' : (redisUrl ? 'MISS' : 'DISABLED'));
 
     if (!data) {

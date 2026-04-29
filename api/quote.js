@@ -2,6 +2,12 @@
 // Busca cotação de um ativo via Yahoo Finance + cache Redis (5min)
 // Uso: /api/quote?symbol=PETR4.SA ou /api/quote?symbol=AAPL,MSFT
 // Debug: adicionar &debug=1
+//
+// VERSÃO 7 (29/04/26): Adicionado pre-market / after-hours / marketState
+// Campos novos no retorno:
+//   - preMarketPrice, preMarketChangePercent
+//   - postMarketPrice, postMarketChangePercent
+//   - marketState ("PRE" | "REGULAR" | "POST" | "CLOSED" | "PREPRE" | "POSTPOST")
 
 const CACHE_TTL = 300; // 5 minutos — cotações mudam frequente, não pode ser 24h
 
@@ -109,9 +115,36 @@ export default async function handler(req, res) {
         }
         const data = await r.json();
 
+        // ────────────────────────────────────────────────
+        // Ramo 1: chart API (v8) — meta fields
+        // ────────────────────────────────────────────────
         const meta = data?.chart?.result?.[0]?.meta;
         if (meta?.regularMarketPrice) {
           const prev = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
+
+          // Cálculo pre/post-market a partir de meta.regularMarketPrice como referência
+          // Yahoo chart API tem: meta.preMarketPrice, meta.postMarketPrice (quando disponível)
+          // mas NEM SEMPRE retorna nessa rota — ramo 2 (quote API) é mais confiável pra isso
+          let preMarketPrice = null, preMarketChangePercent = null;
+          let postMarketPrice = null, postMarketChangePercent = null;
+
+          if (typeof meta.preMarketPrice === 'number' && meta.preMarketPrice > 0) {
+            preMarketPrice = meta.preMarketPrice;
+            // Variação do pre vs. fechamento regular do dia anterior (prev)
+            if (prev && prev > 0) {
+              preMarketChangePercent = ((preMarketPrice - prev) / prev) * 100;
+            }
+          }
+
+          if (typeof meta.postMarketPrice === 'number' && meta.postMarketPrice > 0) {
+            postMarketPrice = meta.postMarketPrice;
+            // Variação do post vs. fechamento regular do DIA (regularMarketPrice)
+            const regular = meta.regularMarketPrice;
+            if (regular && regular > 0) {
+              postMarketChangePercent = ((postMarketPrice - regular) / regular) * 100;
+            }
+          }
+
           return {
             symbol:                     meta.symbol || sym,
             name:                       meta.longName || meta.shortName || sym,
@@ -127,10 +160,24 @@ export default async function handler(req, res) {
             dividendDate:               meta.dividendDate || null,
             exDividendDate:             meta.exDividendDate || null,
             trailingAnnualDividendRate: meta.trailingAnnualDividendRate || null,
+            // ============== NOVOS CAMPOS (v7 — 29/04/26) ==============
+            // Estado do mercado: PRE / REGULAR / POST / CLOSED / PREPRE / POSTPOST
+            marketState:                meta.marketState || null,
+            // Pre-market (antes da abertura)
+            preMarketPrice:             preMarketPrice,
+            preMarketChangePercent:     preMarketChangePercent,
+            // After-hours (depois do fechamento)
+            postMarketPrice:            postMarketPrice,
+            postMarketChangePercent:    postMarketChangePercent,
+            // ============================================================
             timestamp:                  Date.now(),
           };
         }
 
+        // ────────────────────────────────────────────────
+        // Ramo 2: quote API (v7) — fields diretos no result
+        // Yahoo quote API é a MAIS CONFIÁVEL pra pre/post-market
+        // ────────────────────────────────────────────────
         const q = data?.quoteResponse?.result?.[0];
         if (q?.regularMarketPrice) {
           const prev = q.regularMarketPreviousClose || q.regularMarketPrice;
@@ -149,6 +196,16 @@ export default async function handler(req, res) {
             dividendDate:               q.dividendDate || null,
             exDividendDate:             q.exDividendDate || null,
             trailingAnnualDividendRate: q.trailingAnnualDividendRate || null,
+            // ============== NOVOS CAMPOS (v7 — 29/04/26) ==============
+            // Estado do mercado: PRE / REGULAR / POST / CLOSED / PREPRE / POSTPOST
+            marketState:                q.marketState || null,
+            // Pre-market (antes da abertura) — Yahoo retorna direto
+            preMarketPrice:             (typeof q.preMarketPrice === 'number') ? q.preMarketPrice : null,
+            preMarketChangePercent:     (typeof q.preMarketChangePercent === 'number') ? q.preMarketChangePercent : null,
+            // After-hours (depois do fechamento) — Yahoo retorna direto
+            postMarketPrice:            (typeof q.postMarketPrice === 'number') ? q.postMarketPrice : null,
+            postMarketChangePercent:    (typeof q.postMarketChangePercent === 'number') ? q.postMarketChangePercent : null,
+            // ============================================================
             timestamp:                  Date.now(),
           };
         }

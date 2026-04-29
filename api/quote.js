@@ -224,7 +224,10 @@ export default async function handler(req, res) {
   // Função que consulta cache ou Yahoo pra UM ticker
   // ────────────────────────────────────────────────────
   async function getQuoteWithCache(sym) {
-    const cacheKey = `quote:${sym}`;
+    // VERSÃO v2 (29/04/26): inclui marketState + pre/post-market.
+    // Bumpar a versão invalida automaticamente caches da versão anterior
+    // (sem precisar de FLUSHALL manual no Redis).
+    const cacheKey = `quote:v2:${sym}`;
 
     // Tenta cache
     if (redisUrl && redisToken) {

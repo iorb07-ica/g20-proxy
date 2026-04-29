@@ -95,7 +95,7 @@ export default async function handler(req, res) {
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  async function fetchQuote(sym, attempt = 0) {
+  async function fetchQuote(sym, attempt = 0, traceLog = null) {
     // ORDEM IMPORTANTE: v7/quote PRIMEIRO porque retorna marketState +
     // preMarketPrice + postMarketPrice. v8/chart é fallback (não tem esses campos consistentemente).
     const urls = [
@@ -108,10 +108,11 @@ export default async function handler(req, res) {
     for (let i = 0; i < urls.length; i++) {
       try {
         const r = await fetch(urls[i], { headers: HEADERS });
+        if (traceLog) traceLog.push(`url[${i}] status=${r.status}`);
         if (!r.ok) {
           if (r.status === 429 && attempt < 2) {
             await sleep(500 * (attempt + 1));
-            return fetchQuote(sym, attempt + 1);
+            return fetchQuote(sym, attempt + 1, traceLog);
           }
           continue;
         }
@@ -122,6 +123,7 @@ export default async function handler(req, res) {
         // ────────────────────────────────────────────────
         const meta = data?.chart?.result?.[0]?.meta;
         if (meta?.regularMarketPrice) {
+          if (traceLog) traceLog.push(`url[${i}] hit=v8/chart marketState=${meta.marketState||'undef'} hasPre=${!!meta.preMarketPrice} hasPost=${!!meta.postMarketPrice}`);
           const prev = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
 
           // Cálculo pre/post-market a partir de meta.regularMarketPrice como referência
@@ -182,6 +184,7 @@ export default async function handler(req, res) {
         // ────────────────────────────────────────────────
         const q = data?.quoteResponse?.result?.[0];
         if (q?.regularMarketPrice) {
+          if (traceLog) traceLog.push(`url[${i}] hit=v7/quote marketState=${q.marketState||'undef'} hasPre=${!!q.preMarketPrice} hasPost=${!!q.postMarketPrice}`);
           const prev = q.regularMarketPreviousClose || q.regularMarketPrice;
           return {
             symbol:                     q.symbol || sym,
@@ -211,12 +214,15 @@ export default async function handler(req, res) {
             timestamp:                  Date.now(),
           };
         }
-      } catch {}
+      } catch (e) {
+        if (traceLog) traceLog.push(`url[${i}] threw=${(e.message||'').slice(0,60)}`);
+      }
     }
 
     if (attempt < 2) {
+      if (traceLog) traceLog.push(`retry attempt=${attempt+1}`);
       await sleep(300 * (attempt + 1));
-      return fetchQuote(sym, attempt + 1);
+      return fetchQuote(sym, attempt + 1, traceLog);
     }
 
     return null;
@@ -225,11 +231,10 @@ export default async function handler(req, res) {
   // ────────────────────────────────────────────────────
   // Função que consulta cache ou Yahoo pra UM ticker
   // ────────────────────────────────────────────────────
-  async function getQuoteWithCache(sym) {
-    // VERSÃO v3 (29/04/26): v7/quote prioritário pra capturar marketState + pre/post-market.
-    // Bumpar a versão invalida automaticamente caches da versão anterior
-    // (sem precisar de FLUSHALL manual no Redis).
-    const cacheKey = `quote:v3:${sym}`;
+  async function getQuoteWithCache(sym, traceOut) {
+    // VERSÃO v4 (29/04/26): v7/quote prioritário + trace de debug.
+    // Bumpar a versão invalida automaticamente caches da versão anterior.
+    const cacheKey = `quote:v4:${sym}`;
 
     // Tenta cache
     if (redisUrl && redisToken) {
@@ -240,7 +245,7 @@ export default async function handler(req, res) {
     }
 
     // Busca Yahoo
-    const q = await fetchQuote(sym);
+    const q = await fetchQuote(sym, 0, traceOut);
     if (!q) return { data: null, cacheHit: false };
 
     // Salva no cache
@@ -255,8 +260,10 @@ export default async function handler(req, res) {
   // 1 símbolo só
   // ────────────────────────────────────────────────────
   if (symbols.length === 1) {
-    const { data, cacheHit } = await getQuoteWithCache(symbols[0]);
+    const traceOut = isDebug ? [] : null;
+    const { data, cacheHit } = await getQuoteWithCache(symbols[0], traceOut);
     debugInfo.steps.push(cacheHit ? 'cache hit' : 'cache miss + yahoo fetch');
+    if (traceOut && traceOut.length) debugInfo.trace = traceOut;
     res.setHeader('X-Cache-Status', cacheHit ? 'HIT' : (redisUrl ? 'MISS' : 'DISABLED'));
 
     if (!data) {

@@ -82,7 +82,7 @@ export default async function handler(req, res) {
 
   const symbols = symbol.split(',').map(s => s.trim()).filter(Boolean);
   debugInfo.symbolsCount = symbols.length;
-  debugInfo._VERSION_MARKER = 'V5_FINAL_RIGHT_NOW_29ABR_0103'; // ← marker SUPER único pra confirmar deploy
+  debugInfo._VERSION_MARKER = 'V6_PREPOST_29ABR_0115'; // ← v6: includePrePost=true no v8/chart
 
   const redisUrl   = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -97,13 +97,14 @@ export default async function handler(req, res) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function fetchQuote(sym, attempt = 0, traceLog = null) {
-    // ORDEM IMPORTANTE: v7/quote PRIMEIRO porque retorna marketState +
-    // preMarketPrice + postMarketPrice. v8/chart é fallback (não tem esses campos consistentemente).
+    // YAHOO V7/QUOTE retorna 401 desde fim de 2023 (precisa cookie+crumb).
+    // Solução: usar v8/chart com includePrePost=true que retorna pre/post nos meta fields.
+    // Mantemos v7 como tentativa pra caso voltem a permitir; v8 com prepost é o real.
     const urls = [
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d&includePrePost=true`,
+      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d&includePrePost=true`,
       `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(sym)}`,
       `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(sym)}`,
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
-      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
     ];
 
     for (let i = 0; i < urls.length; i++) {
@@ -233,9 +234,8 @@ export default async function handler(req, res) {
   // Função que consulta cache ou Yahoo pra UM ticker
   // ────────────────────────────────────────────────────
   async function getQuoteWithCache(sym, traceOut) {
-    // VERSÃO v5 (29/04/26): bumpada pra forçar invalidar caches v3/v4 que persistiram.
-    // Bumpar a versão invalida automaticamente caches da versão anterior.
-    const cacheKey = `quote:v5:${sym}`;
+    // VERSÃO v6 (29/04/26): v8/chart com includePrePost=true (v7/quote retorna 401 sem cookie).
+    const cacheKey = `quote:v6:${sym}`;
 
     // Tenta cache
     if (redisUrl && redisToken) {

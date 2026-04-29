@@ -82,6 +82,7 @@ export default async function handler(req, res) {
 
   const symbols = symbol.split(',').map(s => s.trim()).filter(Boolean);
   debugInfo.symbolsCount = symbols.length;
+  debugInfo._VERSION_MARKER = 'V5_FINAL_RIGHT_NOW_29ABR_0103'; // ← marker SUPER único pra confirmar deploy
 
   const redisUrl   = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -232,9 +233,9 @@ export default async function handler(req, res) {
   // Função que consulta cache ou Yahoo pra UM ticker
   // ────────────────────────────────────────────────────
   async function getQuoteWithCache(sym, traceOut) {
-    // VERSÃO v4 (29/04/26): v7/quote prioritário + trace de debug.
+    // VERSÃO v5 (29/04/26): bumpada pra forçar invalidar caches v3/v4 que persistiram.
     // Bumpar a versão invalida automaticamente caches da versão anterior.
-    const cacheKey = `quote:v4:${sym}`;
+    const cacheKey = `quote:v5:${sym}`;
 
     // Tenta cache
     if (redisUrl && redisToken) {

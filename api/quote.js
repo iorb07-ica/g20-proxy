@@ -96,11 +96,13 @@ export default async function handler(req, res) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function fetchQuote(sym, attempt = 0) {
+    // ORDEM IMPORTANTE: v7/quote PRIMEIRO porque retorna marketState +
+    // preMarketPrice + postMarketPrice. v8/chart é fallback (não tem esses campos consistentemente).
     const urls = [
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
-      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
       `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(sym)}`,
       `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(sym)}`,
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
+      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
     ];
 
     for (let i = 0; i < urls.length; i++) {
@@ -224,10 +226,10 @@ export default async function handler(req, res) {
   // Função que consulta cache ou Yahoo pra UM ticker
   // ────────────────────────────────────────────────────
   async function getQuoteWithCache(sym) {
-    // VERSÃO v2 (29/04/26): inclui marketState + pre/post-market.
+    // VERSÃO v3 (29/04/26): v7/quote prioritário pra capturar marketState + pre/post-market.
     // Bumpar a versão invalida automaticamente caches da versão anterior
     // (sem precisar de FLUSHALL manual no Redis).
-    const cacheKey = `quote:v2:${sym}`;
+    const cacheKey = `quote:v3:${sym}`;
 
     // Tenta cache
     if (redisUrl && redisToken) {

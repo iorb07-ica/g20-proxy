@@ -82,7 +82,7 @@ export default async function handler(req, res) {
 
   const symbols = symbol.split(',').map(s => s.trim()).filter(Boolean);
   debugInfo.symbolsCount = symbols.length;
-  debugInfo._VERSION_MARKER = 'V6_PREPOST_29ABR_0115'; // ← v6: includePrePost=true no v8/chart
+  debugInfo._VERSION_MARKER = 'V7_DUMP_KEYS_29ABR_0125'; // ← v7: dumpa keys do meta no trace
 
   const redisUrl   = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -125,7 +125,11 @@ export default async function handler(req, res) {
         // ────────────────────────────────────────────────
         const meta = data?.chart?.result?.[0]?.meta;
         if (meta?.regularMarketPrice) {
-          if (traceLog) traceLog.push(`url[${i}] hit=v8/chart marketState=${meta.marketState||'undef'} hasPre=${!!meta.preMarketPrice} hasPost=${!!meta.postMarketPrice}`);
+          if (traceLog) {
+            traceLog.push(`url[${i}] hit=v8/chart marketState=${meta.marketState||'undef'} hasPre=${!!meta.preMarketPrice} hasPost=${!!meta.postMarketPrice}`);
+            // DEBUG: lista todas as chaves do meta pra ver o que Yahoo está retornando
+            traceLog.push(`url[${i}] meta_keys=${Object.keys(meta).join(',').slice(0,500)}`);
+          }
           const prev = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
 
           // Cálculo pre/post-market a partir de meta.regularMarketPrice como referência
@@ -234,8 +238,8 @@ export default async function handler(req, res) {
   // Função que consulta cache ou Yahoo pra UM ticker
   // ────────────────────────────────────────────────────
   async function getQuoteWithCache(sym, traceOut) {
-    // VERSÃO v6 (29/04/26): v8/chart com includePrePost=true (v7/quote retorna 401 sem cookie).
-    const cacheKey = `quote:v6:${sym}`;
+    // VERSÃO v7 (29/04/26): adiciona dump de meta_keys pra debug.
+    const cacheKey = `quote:v7:${sym}`;
 
     // Tenta cache
     if (redisUrl && redisToken) {

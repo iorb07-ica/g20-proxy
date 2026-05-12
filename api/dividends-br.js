@@ -45,19 +45,32 @@ function daysDiff(dateA, dateB) {
 }
 
 // ── STATUSINVEST ──────────────────────────────────────────
+// Tenta as duas URLs em paralelo (ação e FII) — usa a que retornar dados
 async function fetchStatusinvest(symbol) {
-  const url = `https://statusinvest.com.br/acao/payoutresult?search=${symbol}&type=3`;
-  const r   = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': 'application/json, text/plain, */*',
-      'Referer': `https://statusinvest.com.br/fundos-imobiliarios/${symbol.toLowerCase()}`
-    }
-  });
-  if (!r.ok) throw new Error('Statusinvest HTTP ' + r.status);
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Referer': `https://statusinvest.com.br/`
+  };
 
-  const data = await r.json();
-  const list = Array.isArray(data) ? data : (data?.assetEarningsModels || data?.list || []);
+  const urls = [
+    `https://statusinvest.com.br/acao/payoutresult?search=${symbol}&type=3`,
+    `https://statusinvest.com.br/fundoImobiliario/payoutresult?search=${symbol}&type=3`
+  ];
+
+  const results = await Promise.allSettled(
+    urls.map(url => fetch(url, { headers }).then(r => r.ok ? r.json() : null))
+  );
+
+  // Pega a resposta com mais dados
+  let list = [];
+  for (const res of results) {
+    if (res.status !== 'fulfilled' || !res.value) continue;
+    const data    = res.value;
+    const entries = Array.isArray(data) ? data : (data?.assetEarningsModels || data?.list || []);
+    if (entries.length > list.length) list = entries;
+  }
+
   if (!list.length) return [];
 
   return list.map(d => {

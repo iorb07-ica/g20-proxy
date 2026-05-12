@@ -2,14 +2,11 @@
 // Busca dividendos via Statusinvest (scraping do endpoint JSON interno)
 // Cobertura: ações + FIIs + ETFs, histórico desde 2016 (10+ anos)
 // Fornece: payment_date + ex_date separados, tipo (DIV/JCP/Rendimento)
+// Inclui proventos futuros/aprovados com status: 'futuro'
 // Uso: /api/provents-si?symbol=MXRF11&from=2019-01-01
-// Debug: adicionar &debug=1
 
 const CACHE_TTL = 86400; // 24 horas
 
-// ────────────────────────────────────────────────────
-// Upstash REST API helpers — formato correto
-// ────────────────────────────────────────────────────
 async function redisGet(url, token, key) {
   try {
     const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
@@ -17,51 +14,27 @@ async function redisGet(url, token, key) {
     });
     if (!r.ok) return null;
     const d = await r.json();
-    // d.result vem como string (valor salvo) ou null
     if (!d.result) return null;
-    // Parseia o JSON salvo (que era um array de dividendos)
-    try {
-      return JSON.parse(d.result);
-    } catch {
-      return null;
-    }
-  } catch {
-    return null;
-  }
+    try { return JSON.parse(d.result); } catch { return null; }
+  } catch { return null; }
 }
 
 async function redisSet(url, token, key, value, debugInfo) {
   try {
-    // Upstash REST Pipeline API — formato 100% garantido para valores grandes
-    // Array de comandos Redis: [["SET", "key", "value", "EX", "86400"]]
     const serialized = JSON.stringify(value);
     if (debugInfo) debugInfo.saveSize = serialized.length;
-
     const r = await fetch(`${url}/pipeline`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify([
-        ['SET', key, serialized, 'EX', String(CACHE_TTL)]
-      ])
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify([['SET', key, serialized, 'EX', String(CACHE_TTL)]])
     });
-
     if (debugInfo) debugInfo.saveStatus = r.status;
-
     if (!r.ok) {
-      if (debugInfo) {
-        const errText = await r.text().catch(() => '');
-        debugInfo.saveError = errText.slice(0, 300);
-      }
+      if (debugInfo) { const e = await r.text().catch(()=>''); debugInfo.saveError = e.slice(0,300); }
       return false;
     }
-
     const result = await r.json();
-    if (debugInfo) debugInfo.saveResult = JSON.stringify(result).slice(0, 200);
-
-    // Pipeline retorna array de resultados: [{result: "OK"}]
+    if (debugInfo) debugInfo.saveResult = JSON.stringify(result).slice(0,200);
     return Array.isArray(result) && result[0] && result[0].result === 'OK';
   } catch (e) {
     if (debugInfo) debugInfo.saveException = e.message;
@@ -69,23 +42,14 @@ async function redisSet(url, token, key, value, debugInfo) {
   }
 }
 
-// Detecta tipo de ativo pelo ticker para escolher a rota correta
 function detectAssetType(symbol) {
   symbol = symbol.toUpperCase();
-  // FIIs: 4 letras + 11 ou 12 (ex: MXRF11, HGLG11)
   if (/^[A-Z]{4}(11|12)$/.test(symbol)) return 'fii';
-  // ETFs conhecidos (geralmente terminam em 11 mas são ETFs)
-  // Por enquanto tratamos como FII (rota companytickerprovents)
-  // Ações: 4 letras + 3 ou 4 (ex: PETR4, VALE3)
   if (/^[A-Z]{4}[34]$/.test(symbol)) return 'acao';
-  // Unit (ações com 11): SANB11, TAEE11 — difícil distinguir de FII
-  // Heurística: se termina em 11 mas é ação/unit, o ticker geralmente começa com
-  // empresa conhecida. Tratamos como 'acao' se não for FII conhecido.
-  if (/^[A-Z]{4}11$/.test(symbol)) return 'acao'; // Unit
-  return 'acao'; // default
+  if (/^[A-Z]{4}11$/.test(symbol)) return 'acao';
+  return 'acao';
 }
 
-// Converte "dd/MM/yyyy" -> "yyyy-MM-dd"
 function brToISO(dateBR) {
   if (!dateBR || typeof dateBR !== 'string') return null;
   const parts = dateBR.split('/');
@@ -95,7 +59,6 @@ function brToISO(dateBR) {
   return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
 }
 
-// Normaliza tipo de provento
 function normalizeType(et) {
   if (!et) return 'Dividendo';
   const up = String(et).toUpperCase();
@@ -107,12 +70,8 @@ function normalizeType(et) {
 }
 
 async function fetchStatusinvest(symbol, assetType, debugInfo) {
-  // Endpoints descobertos:
-  // FII: https://statusinvest.com.br/fii/companytickerprovents?ticker=MXRF11&chartProventsType=2
-  // Ação: https://statusinvest.com.br/acao/companytickerprovents?ticker=PETR4&chartProventsType=2
   const path = assetType === 'fii' ? 'fii' : 'acao';
   const url = `https://statusinvest.com.br/${path}/companytickerprovents?ticker=${encodeURIComponent(symbol)}&chartProventsType=2`;
-
   debugInfo.siUrl = url;
   debugInfo.siAssetType = assetType;
 
@@ -137,16 +96,15 @@ async function fetchStatusinvest(symbol, assetType, debugInfo) {
 
   const data = await r.json();
   debugInfo.siDataKeys = data ? Object.keys(data) : [];
-
   const rawList = (data && data.assetEarningsModels) ? data.assetEarningsModels : [];
   debugInfo.siRawCount = rawList.length;
-
   return rawList;
 }
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count, X-Future-Count');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
@@ -156,7 +114,6 @@ export default async function handler(req, res) {
 
   if (!symbol) return res.status(400).json({ error: 'symbol obrigatorio' });
 
-  // Normaliza: remove .SA, uppercase
   symbol = String(symbol).replace(/\.SA$/i, '').toUpperCase().trim();
   debugInfo.symbol = symbol;
 
@@ -173,16 +130,22 @@ export default async function handler(req, res) {
   const cacheKey   = `provents-si:${symbol}`;
   debugInfo.hasRedis = !!(redisUrl && redisToken);
 
-  // ────────────────────────────────────────────────────
   // Cache LOOKUP
-  // ────────────────────────────────────────────────────
   if (redisUrl && redisToken) {
     const cached = await redisGet(redisUrl, redisToken, cacheKey);
     if (cached && Array.isArray(cached)) {
       debugInfo.steps.push('cache hit: ' + cached.length + ' registros');
       res.setHeader('X-Cache-Status', 'HIT');
       res.setHeader('X-Cache-Count', String(cached.length));
-      const filtered = cached.filter(d => d.payment_date >= fromDate);
+      // Retorna histórico (>= fromDate) + todos os futuros
+      const today = new Date().toISOString().split('T')[0];
+      const filtered = cached.filter(d =>
+        d.payment_date >= fromDate ||
+        d.status === 'futuro' ||
+        d.payment_date > today
+      );
+      const futureCount = filtered.filter(d => d.status === 'futuro' || d.payment_date > today).length;
+      res.setHeader('X-Future-Count', String(futureCount));
       if (isDebug) return res.json({ _debug: debugInfo, data: filtered });
       return res.json(filtered);
     }
@@ -192,19 +155,15 @@ export default async function handler(req, res) {
     res.setHeader('X-Cache-Status', 'DISABLED');
   }
 
-  // ────────────────────────────────────────────────────
   // Statusinvest fetch
-  // ────────────────────────────────────────────────────
   try {
     debugInfo.steps.push('calling Statusinvest...');
     let rawList = await fetchStatusinvest(symbol, assetType, debugInfo);
 
-    // Se deu lista vazia e tentamos FII, tenta como ação (alguns UNITs confundem)
     if (rawList.length === 0 && assetType === 'fii') {
       debugInfo.steps.push('fii vazio, tentando como acao...');
       rawList = await fetchStatusinvest(symbol, 'acao', debugInfo);
     }
-    // Se tentamos ação e deu vazio, tenta como FII
     if (rawList.length === 0 && assetType === 'acao') {
       debugInfo.steps.push('acao vazio, tentando como fii...');
       rawList = await fetchStatusinvest(symbol, 'fii', debugInfo);
@@ -216,24 +175,38 @@ export default async function handler(req, res) {
       return res.json([]);
     }
 
+    const today = new Date().toISOString().split('T')[0];
+
     const dividends = rawList
       .map(d => {
         const payDate = brToISO(d.pd);
         const exDate  = brToISO(d.ed);
         const valor   = parseFloat(d.v) || 0;
-        if (!payDate || !valor) return null;
+
+        // Provento aprovado sem data de pagamento definida (ex: "31/12/9999")
+        // ou com data futura — inclui como 'futuro'
+        const isSemData = !payDate || payDate.startsWith('9999');
+        const isFuturo  = isSemData || (payDate && payDate > today);
+
+        // Descarta apenas se não tem valor E não tem data ex — sem info suficiente
+        if (!valor && !exDate) return null;
+        if (!valor) return null;
+
+        // Para proventos sem data de pagamento, usa ex_date como referência
+        const dataEfetiva = isSemData ? (exDate || today) : payDate;
 
         return {
-          payment_date: payDate,
-          ex_date:      exDate || payDate,
+          payment_date: dataEfetiva,
+          ex_date:      exDate || dataEfetiva,
           value:        valor,
           type:         normalizeType(d.et || d.etd),
           adjusted:     !!d.adj,
-          source:       'Statusinvest'
+          source:       'Statusinvest',
+          status:       isFuturo ? 'futuro' : 'recebido'
         };
       })
       .filter(Boolean)
-      // Dedup por data+valor+tipo (proteção extra)
+      // Dedup por data+valor+tipo
       .filter((d, i, arr) => {
         const k = d.payment_date + '|' + d.value.toFixed(6) + '|' + d.type;
         return arr.findIndex(x => (x.payment_date + '|' + x.value.toFixed(6) + '|' + x.type) === k) === i;
@@ -241,22 +214,33 @@ export default async function handler(req, res) {
       .sort((a, b) => b.payment_date.localeCompare(a.payment_date));
 
     debugInfo.dividendsCount = dividends.length;
-    if (dividends.length > 0) {
-      debugInfo.oldestDividend = dividends[dividends.length - 1].payment_date;
-      debugInfo.newestDividend = dividends[0].payment_date;
-    }
-    debugInfo.steps.push('success: ' + dividends.length + ' dividendos processados');
+    const futureCount = dividends.filter(d => d.status === 'futuro').length;
+    debugInfo.futureCount = futureCount;
 
-    // ────────────────────────────────────────────────────
-    // Cache SAVE
-    // ────────────────────────────────────────────────────
+    if (dividends.length > 0) {
+      const recebidos = dividends.filter(d => d.status === 'recebido');
+      if (recebidos.length) {
+        debugInfo.oldestDividend = recebidos[recebidos.length - 1].payment_date;
+        debugInfo.newestDividend = recebidos[0].payment_date;
+      }
+    }
+    debugInfo.steps.push('success: ' + dividends.length + ' dividendos (' + futureCount + ' futuros)');
+
+    // Cache SAVE — salva tudo (recebidos + futuros)
     if (redisUrl && redisToken && dividends.length > 0) {
       const saved = await redisSet(redisUrl, redisToken, cacheKey, dividends, debugInfo);
       debugInfo.steps.push('cache save: ' + (saved ? 'OK' : 'FAIL'));
     }
 
-    const filtered = dividends.filter(d => d.payment_date >= fromDate);
-    debugInfo.afterFilter = filtered.length;
+    // Retorna: histórico >= fromDate + todos os futuros
+    const filtered = dividends.filter(d =>
+      d.payment_date >= fromDate ||
+      d.status === 'futuro' ||
+      d.payment_date > today
+    );
+
+    res.setHeader('X-Cache-Count', String(filtered.length));
+    res.setHeader('X-Future-Count', String(futureCount));
 
     if (isDebug) return res.json({ _debug: debugInfo, data: filtered });
     return res.json(filtered);

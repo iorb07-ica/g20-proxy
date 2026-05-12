@@ -1,9 +1,7 @@
 // api/dividends-br.js — Vercel Serverless Function
-// Roteamento por tipo real do ativo:
-//   FII  → Statusinvest (primário, histórico completo)
-//   AÇÃO → Yahoo Finance (primário, histórico 10+ anos) + B3 (fallback, ex_date/tipo precisos)
-// Detecção do tipo: consulta a B3 para saber se o ativo é FII ou Ação —
-//   sem lista hardcoded, funciona para qualquer ticker presente ou futuro.
+// Estratégia: Statusinvest + Yahoo Finance em paralelo → merge inteligente
+// Deduplicação: mesmo valor (±1%) dentro de janela de 15 dias = mesmo provento
+// Sem classificação de tipo de ativo — funciona para FIIs, ações e Units automaticamente
 
 const CACHE_TTL = 86400; // 24 horas
 
@@ -33,50 +31,6 @@ async function redisSet(url, token, key, value) {
   } catch { return false; }
 }
 
-// ── DETECÇÃO DE TIPO REAL ──────────────────────────────────
-// Consulta a B3 para saber se o ativo é FII ou Ação.
-// FIIs sempre têm "FII", "FUNDO", "FDO", "IMOB" ou "FIAGRO" no nome corporativo.
-// Isso resolve TAEE11, SANB11, SAPR11, BPAC11, KLBN11 etc. corretamente —
-// são Units (ações) que terminam em 11 mas NÃO são fundos imobiliários.
-async function detectAssetType(symbol) {
-  const identifier = symbol.substring(0, 4);
-
-  try {
-    const params = JSON.stringify({ cnpj: '', identifierFund: identifier, typeFund: 27 });
-    const b64    = Buffer.from(params).toString('base64');
-    const url    = `https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetListedSupplementFunds/${b64}`;
-    const r      = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'application/json',
-        'Referer': 'https://www.b3.com.br/'
-      }
-    });
-
-    if (r.ok) {
-      const data = await r.json();
-      const name = (
-        data?.detailFund?.companyName ||
-        data?.detailFund?.fundName    ||
-        data?.detailFund?.typeFund    || ''
-      ).toUpperCase();
-
-      // Palavras que identificam inequivocamente um Fundo Imobiliário
-      const FII_KEYWORDS = ['FII', 'FUNDO DE INVESTIMENTO IMOBILIARIO', 'FUNDO IMOBILIARIO',
-                            'FDO IMOB', 'FIAGRO', 'CRI', 'LCI'];
-      if (FII_KEYWORDS.some(kw => name.includes(kw))) return 'FII';
-
-      // B3 retornou dados mas nome não contém palavras de FII → é ação (Unit terminada em 11)
-      if (data?.detailFund?.companyName) return 'ACAO';
-    }
-  } catch { /* silencioso — fallback abaixo */ }
-
-  // Se não conseguiu determinar via B3:
-  // Heurística de último recurso — FIIs brasileiros quase sempre terminam em 11 ou 12,
-  // mas Units também. Sem confirmação da B3, trata como ACAO (mais seguro para dividendos).
-  return 'ACAO';
-}
-
 // ── HELPER ────────────────────────────────────────────────
 function toISO(dateBR) {
   if (!dateBR) return null;
@@ -86,7 +40,11 @@ function toISO(dateBR) {
   return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
 }
 
-// ── STATUSINVEST (para FIIs) ───────────────────────────────
+function daysDiff(dateA, dateB) {
+  return Math.abs(new Date(dateA) - new Date(dateB)) / 86400000;
+}
+
+// ── STATUSINVEST ──────────────────────────────────────────
 async function fetchStatusinvest(symbol) {
   const url = `https://statusinvest.com.br/acao/payoutresult?search=${symbol}&type=3`;
   const r   = await fetch(url, {
@@ -96,7 +54,6 @@ async function fetchStatusinvest(symbol) {
       'Referer': `https://statusinvest.com.br/fundos-imobiliarios/${symbol.toLowerCase()}`
     }
   });
-
   if (!r.ok) throw new Error('Statusinvest HTTP ' + r.status);
 
   const data = await r.json();
@@ -114,19 +71,13 @@ async function fetchStatusinvest(symbol) {
     if (tipoRaw.includes('JCP') || tipoRaw.includes('JUROS')) tipo = 'JCP';
     else if (tipoRaw.includes('DIV'))                          tipo = 'Dividendo';
 
-    return {
-      payment_date: payDate,
-      ex_date:      exDate || payDate,
-      value:        valor,
-      type:         tipo,
-      source:       'Statusinvest'
-    };
+    return { payment_date: payDate, ex_date: exDate || payDate, value: valor, type: tipo, source: 'Statusinvest' };
   })
   .filter(Boolean)
   .sort((a, b) => b.payment_date.localeCompare(a.payment_date));
 }
 
-// ── YAHOO FINANCE (para ações BR) ─────────────────────────
+// ── YAHOO FINANCE ─────────────────────────────────────────
 async function fetchYahoo(symbol) {
   const ticker = symbol.toUpperCase() + '.SA';
   const now    = Math.floor(Date.now() / 1000);
@@ -141,7 +92,6 @@ async function fetchYahoo(symbol) {
       'Accept-Language': 'pt-BR,pt;q=0.9'
     }
   });
-
   if (!r.ok) throw new Error('Yahoo HTTP ' + r.status);
 
   const data   = await r.json();
@@ -150,91 +100,47 @@ async function fetchYahoo(symbol) {
 
   return Object.values(events).map(d => {
     const payDate = new Date(d.date * 1000).toISOString().split('T')[0];
-    return {
-      payment_date: payDate,
-      ex_date:      payDate,
-      value:        d.amount || 0,
-      type:         'Dividendo',
-      source:       'Yahoo'
-    };
+    return { payment_date: payDate, ex_date: payDate, value: d.amount || 0, type: 'Dividendo', source: 'Yahoo' };
   })
   .filter(d => d.value > 0)
   .sort((a, b) => b.payment_date.localeCompare(a.payment_date));
 }
 
-// ── B3 OFICIAL (fallback para ações) ──────────────────────
-async function fetchB3(symbol) {
-  const identifier = symbol.substring(0, 4);
-  const params     = JSON.stringify({ cnpj: '', identifierFund: identifier, typeFund: 3 });
-  const b64        = Buffer.from(params).toString('base64');
-  const url        = `https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetListedSupplementFunds/${b64}`;
+// ── MERGE INTELIGENTE ─────────────────────────────────────
+// Dois registros são o mesmo provento se:
+//   - valores iguais com tolerância de 1%
+//   - datas dentro de uma janela de 15 dias
+// Nesse caso mantém apenas um, priorizando o que tem mais informação
+// (Statusinvest tem ex_date e tipo corretos; Yahoo tem histórico mais longo)
+function mergeIntelligente(si, yahoo) {
+  // Começa com todos do Statusinvest como base
+  const resultado = [...si];
 
-  const r = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0',
-      'Accept': 'application/json, text/plain, */*',
-      'Referer': 'https://www.b3.com.br/',
-      'Origin': 'https://www.b3.com.br'
+  for (const y of yahoo) {
+    // Verifica se já existe um registro equivalente vindo do Statusinvest
+    const duplicata = resultado.find(r => {
+      const valorSimilar = Math.abs(r.value - y.value) / Math.max(r.value, y.value) < 0.01;
+      const dataProxima  = daysDiff(r.payment_date, y.payment_date) <= 15;
+      return valorSimilar && dataProxima;
+    });
+
+    if (!duplicata) {
+      // Registro novo — adiciona do Yahoo (histórico mais antigo geralmente)
+      resultado.push(y);
+    } else if (duplicata.source === 'Statusinvest') {
+      // Já temos pelo Statusinvest — enriquece com source combinado
+      duplicata.source = 'SI+Yahoo';
     }
-  });
+  }
 
-  if (!r.ok) throw new Error('B3 HTTP ' + r.status);
-
-  const data          = await r.json();
-  const cashDividends = data?.cashDividends || [];
-  if (!cashDividends.length) return [];
-
-  return cashDividends.map(d => {
-    const payDate = toISO(d.paymentDate);
-    const exDate  = toISO(d.lastDatePrior);
-    const valor   = parseFloat(String(d.rate || 0).replace(',', '.'));
-    if (!payDate || !valor) return null;
-
-    const tipoRaw = (d.label || '').toUpperCase();
-    let tipo = 'Dividendo';
-    if (tipoRaw.includes('JCP') || tipoRaw.includes('JUROS')) tipo = 'JCP';
-    else if (tipoRaw.includes('REND'))                         tipo = 'Rendimento';
-    else if (tipoRaw.includes('BONIF'))                        tipo = 'Bonificacao';
-
-    return {
-      payment_date: payDate,
-      ex_date:      exDate || payDate,
-      value:        valor,
-      type:         tipo,
-      relatedTo:    d.relatedTo || '',
-      source:       'B3'
-    };
-  })
-  .filter(Boolean)
-  .sort((a, b) => b.payment_date.localeCompare(a.payment_date));
-}
-
-// ── MERGE Yahoo + B3 ──────────────────────────────────────
-function mergeDividends(yahoo, b3) {
-  if (!yahoo.length) return b3;
-  if (!b3.length)    return yahoo;
-
-  const b3Map = {};
-  b3.forEach(d => { b3Map[d.payment_date] = d; });
-
-  const merged = yahoo.map(y => {
-    const b = b3Map[y.payment_date];
-    if (b) return { ...y, ex_date: b.ex_date, type: b.type, source: 'Yahoo+B3' };
-    return y;
-  });
-
-  b3.forEach(b => {
-    if (!merged.find(m => m.payment_date === b.payment_date)) merged.push(b);
-  });
-
-  return merged.sort((a, b) => b.payment_date.localeCompare(a.payment_date));
+  return resultado.sort((a, b) => b.payment_date.localeCompare(a.payment_date));
 }
 
 // ── HANDLER ───────────────────────────────────────────────
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count, X-Source, X-Asset-Type');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count, X-Source, X-SI-Count, X-Yahoo-Count');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
@@ -249,72 +155,44 @@ export default async function handler(req, res) {
 
   const redisUrl   = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
-  const cacheKey   = `dividends-br-v3:${symbol}`; // v3 = nova lógica com detecção de tipo
+  const cacheKey   = `dividends-br-v4:${symbol}`; // v4 = merge SI+Yahoo
 
   // Cache lookup
   if (redisUrl && redisToken) {
     const cached = await redisGet(redisUrl, redisToken, cacheKey);
-    if (cached?.dividends && Array.isArray(cached.dividends)) {
+    if (cached && Array.isArray(cached)) {
       res.setHeader('X-Cache-Status', 'HIT');
-      res.setHeader('X-Asset-Type',   cached.assetType || 'unknown');
-      res.setHeader('X-Cache-Count',  String(cached.dividends.length));
-      return res.json(cached.dividends.filter(d => d.payment_date >= fromDate));
+      res.setHeader('X-Cache-Count',  String(cached.length));
+      return res.json(cached.filter(d => d.payment_date >= fromDate));
     }
     res.setHeader('X-Cache-Status', 'MISS');
   }
 
-  // 1) Detecta tipo real (FII ou ACAO) via B3
-  const assetType = await detectAssetType(symbol);
-  res.setHeader('X-Asset-Type', assetType);
+  // Busca Statusinvest + Yahoo em paralelo
+  const [siResult, yahooResult] = await Promise.allSettled([
+    fetchStatusinvest(symbol),
+    fetchYahoo(symbol)
+  ]);
 
-  let dividends = [];
-  let source    = 'none';
+  const siData    = siResult.status    === 'fulfilled' ? siResult.value    : [];
+  const yahooData = yahooResult.status === 'fulfilled' ? yahooResult.value : [];
 
-  if (assetType === 'FII') {
-    // FIIs → Statusinvest (primário) → B3 typeFund=27 (fallback)
-    try {
-      dividends = await fetchStatusinvest(symbol);
-      source    = 'Statusinvest';
-    } catch (e) {
-      console.error(`[dividends-br] SI falhou para ${symbol}:`, e.message);
-      try {
-        const params = JSON.stringify({ cnpj: '', identifierFund: symbol.substring(0, 4), typeFund: 27 });
-        const b64    = Buffer.from(params).toString('base64');
-        const url    = `https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetListedSupplementFunds/${b64}`;
-        const r      = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.b3.com.br/' } });
-        if (r.ok) {
-          const data = await r.json();
-          dividends  = (data?.cashDividends || []).map(d => {
-            const payDate = toISO(d.paymentDate);
-            const valor   = parseFloat(String(d.rate || 0).replace(',', '.'));
-            if (!payDate || !valor) return null;
-            return { payment_date: payDate, ex_date: toISO(d.lastDatePrior) || payDate, value: valor, type: 'Rendimento', source: 'B3' };
-          }).filter(Boolean);
-          source = 'B3';
-        }
-      } catch { /* sem dados */ }
-    }
-  } else {
-    // Ações BR → Yahoo (primário) + B3 (enriquecimento/fallback)
-    const [yahooResult, b3Result] = await Promise.allSettled([
-      fetchYahoo(symbol),
-      fetchB3(symbol)
-    ]);
+  res.setHeader('X-SI-Count',    String(siData.length));
+  res.setHeader('X-Yahoo-Count', String(yahooData.length));
 
-    const yahooData = yahooResult.status === 'fulfilled' ? yahooResult.value : [];
-    const b3Data    = b3Result.status   === 'fulfilled'  ? b3Result.value    : [];
+  const dividends = mergeIntelligente(siData, yahooData);
 
-    dividends = mergeDividends(yahooData, b3Data);
-    source    = yahooData.length && b3Data.length ? 'Yahoo+B3'
-              : yahooData.length ? 'Yahoo' : 'B3';
-  }
+  const source = siData.length && yahooData.length ? 'SI+Yahoo'
+               : siData.length    ? 'Statusinvest'
+               : yahooData.length ? 'Yahoo'
+               : 'none';
 
   res.setHeader('X-Source',      source);
   res.setHeader('X-Cache-Count', String(dividends.length));
 
-  // Salva cache com assetType embutido para não precisar re-detectar
+  // Salva cache
   if (redisUrl && redisToken && dividends.length) {
-    await redisSet(redisUrl, redisToken, cacheKey, { assetType, dividends });
+    await redisSet(redisUrl, redisToken, cacheKey, dividends);
   }
 
   return res.json(dividends.filter(d => d.payment_date >= fromDate));

@@ -1,6 +1,9 @@
 // api/dividends-br.js — Vercel Serverless Function
-// Fonte: B3 oficial (primário) + Yahoo Finance (histórico longo)
-// Complementa o provents-si.js que já cobre Statusinvest
+// Fonte: B3 oficial exclusivamente (sem Yahoo)
+//   FIIs/FIAGROs → GetListedSupplementFunds   (typeFund=27)
+//   Ações        → GetListedSupplementCompany  (endpoint correto para empresas)
+// Usado como FALLBACK quando Statusinvest (provents-si.js) falhar
+// Histórico: ~12-18 meses (B3 direta não tem histórico longo)
 // Uso: /api/dividends-br?symbol=PETR4&from=2020-01-01
 
 const CACHE_TTL = 86400; // 24 horas
@@ -31,6 +34,7 @@ async function redisSet(url, token, key, value) {
   } catch { return false; }
 }
 
+// ── HELPERS ───────────────────────────────────────────────
 function toISO(dateBR) {
   if (!dateBR) return null;
   if (/^\d{4}-\d{2}-\d{2}$/.test(dateBR)) return dateBR;
@@ -40,27 +44,38 @@ function toISO(dateBR) {
 }
 
 function isFII(symbol) {
-  return symbol.endsWith('11') || symbol.endsWith('12');
+  // FIIs e FIAGROs terminam em 11 ou 12
+  return /\d{2}$/.test(symbol) && (symbol.endsWith('11') || symbol.endsWith('12'));
 }
 
-// ── B3 OFICIAL ─────────────────────────────────────────────
-async function fetchB3(symbol) {
-  const identifier = symbol.substring(0, 4);
-  const typeFund   = isFII(symbol) ? 27 : 3;
-  const params     = JSON.stringify({ cnpj: '', identifierFund: identifier, typeFund });
+function normalizeType(label) {
+  const up = (label || '').toUpperCase();
+  if (up.includes('JCP') || up.includes('JUROS')) return 'JCP';
+  if (up.includes('REND'))                         return 'Rendimento';
+  if (up.includes('BONIF'))                        return 'Bonificacao';
+  if (up.includes('AMORT'))                        return 'Amortizacao';
+  return 'Dividendo';
+}
+
+// ── B3: FIIs e FIAGROs ────────────────────────────────────
+// Endpoint: GetListedSupplementFunds
+// Payload: { cnpj: '', identifierFund: 'MXRF', typeFund: 27 }
+async function fetchB3FII(symbol) {
+  const identifier = symbol.substring(0, 4).toUpperCase();
+  const params     = JSON.stringify({ cnpj: '', identifierFund: identifier, typeFund: 27 });
   const b64        = Buffer.from(params).toString('base64');
   const url        = `https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetListedSupplementFunds/${b64}`;
 
   const r = await fetch(url, {
     headers: {
-      'User-Agent': 'Mozilla/5.0',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Accept': 'application/json, text/plain, */*',
       'Referer': 'https://www.b3.com.br/',
       'Origin': 'https://www.b3.com.br'
     }
   });
 
-  if (!r.ok) throw new Error('B3 HTTP ' + r.status);
+  if (!r.ok) throw new Error('B3 FII HTTP ' + r.status);
 
   const data          = await r.json();
   const cashDividends = data?.cashDividends || [];
@@ -71,18 +86,11 @@ async function fetchB3(symbol) {
     const exDate  = toISO(d.lastDatePrior);
     const valor   = parseFloat(String(d.rate || 0).replace(',', '.'));
     if (!payDate || !valor) return null;
-
-    const tipoRaw = (d.label || '').toUpperCase();
-    let tipo = 'Dividendo';
-    if (tipoRaw.includes('JCP') || tipoRaw.includes('JUROS')) tipo = 'JCP';
-    else if (tipoRaw.includes('REND'))                         tipo = 'Rendimento';
-    else if (tipoRaw.includes('BONIF'))                        tipo = 'Bonificacao';
-
     return {
       payment_date: payDate,
       ex_date:      exDate || payDate,
       value:        valor,
-      type:         tipo,
+      type:         normalizeType(d.label),
       relatedTo:    d.relatedTo || '',
       source:       'B3'
     };
@@ -91,56 +99,45 @@ async function fetchB3(symbol) {
   .sort((a, b) => b.payment_date.localeCompare(a.payment_date));
 }
 
-// ── YAHOO FINANCE ─────────────────────────────────────────
-async function fetchYahoo(symbol) {
-  const ticker = symbol.toUpperCase() + '.SA';
-  const now    = Math.floor(Date.now() / 1000);
-  const from   = now - 15 * 365 * 86400;
-  const url    = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}` +
-                 `?period1=${from}&period2=${now}&interval=1d&events=dividends&includePrePost=false`;
+// ── B3: Ações ─────────────────────────────────────────────
+// Endpoint: GetListedSupplementCompany
+// Payload: { code: 'PETR4', language: 'pt-br' }
+async function fetchB3Acao(symbol) {
+  const params = JSON.stringify({ code: symbol.toUpperCase(), language: 'pt-br' });
+  const b64    = Buffer.from(params).toString('base64');
+  const url    = `https://sistemaswebb3-listados.b3.com.br/listedCompaniesProxy/CompanyCall/GetListedSupplementCompany/${b64}`;
 
   const r = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': 'application/json',
-      'Accept-Language': 'pt-BR,pt;q=0.9'
+      'Accept': 'application/json, text/plain, */*',
+      'Referer': 'https://www.b3.com.br/',
+      'Origin': 'https://www.b3.com.br'
     }
   });
-  if (!r.ok) throw new Error('Yahoo HTTP ' + r.status);
 
-  const data   = await r.json();
-  const events = data?.chart?.result?.[0]?.events?.dividends;
-  if (!events || typeof events !== 'object') return [];
+  if (!r.ok) throw new Error('B3 Acao HTTP ' + r.status);
 
-  return Object.values(events).map(d => {
-    const payDate = new Date(d.date * 1000).toISOString().split('T')[0];
+  const data          = await r.json();
+  const cashDividends = data?.cashDividends || [];
+  if (!cashDividends.length) return [];
+
+  return cashDividends.map(d => {
+    const payDate = toISO(d.paymentDate);
+    const exDate  = toISO(d.lastDatePrior);
+    const valor   = parseFloat(String(d.rate || 0).replace(',', '.'));
+    if (!payDate || !valor) return null;
     return {
       payment_date: payDate,
-      ex_date:      payDate,
-      value:        d.amount || 0,
-      type:         'Dividendo',
-      source:       'Yahoo'
+      ex_date:      exDate || payDate,
+      value:        valor,
+      type:         normalizeType(d.label),
+      relatedTo:    d.relatedTo || '',
+      source:       'B3'
     };
   })
-  .filter(d => d.value > 0)
+  .filter(Boolean)
   .sort((a, b) => b.payment_date.localeCompare(a.payment_date));
-}
-
-// ── MERGE: B3 (primário) + Yahoo (histórico longo) ────────
-function mergeDividends(b3, yahoo) {
-  if (!b3.length)    return yahoo;
-  if (!yahoo.length) return b3;
-
-  const b3Map = {};
-  b3.forEach(d => { b3Map[d.payment_date] = d; });
-
-  const merged = [...b3];
-
-  yahoo.forEach(y => {
-    if (!b3Map[y.payment_date]) merged.push(y);
-  });
-
-  return merged.sort((a, b) => b.payment_date.localeCompare(a.payment_date));
 }
 
 // ── HANDLER ───────────────────────────────────────────────
@@ -154,7 +151,7 @@ export default async function handler(req, res) {
   let { symbol, from } = req.query;
   if (!symbol) return res.status(400).json({ error: 'symbol obrigatório' });
 
-  symbol = symbol.replace(/\.SA$/i, '').toUpperCase();
+  symbol = symbol.replace(/\.SA$/i, '').toUpperCase().trim();
 
   const fromDate = from
     ? (/^\d{4}-\d{2}-\d{2}$/.test(from) ? from : new Date(parseInt(from) * 1000).toISOString().split('T')[0])
@@ -162,7 +159,7 @@ export default async function handler(req, res) {
 
   const redisUrl   = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
-  const cacheKey   = `dividends-br-v2:${symbol}`;
+  const cacheKey   = `dividends-br-v3:${symbol}`;
 
   // Cache lookup
   if (redisUrl && redisToken) {
@@ -170,26 +167,39 @@ export default async function handler(req, res) {
     if (cached && Array.isArray(cached)) {
       res.setHeader('X-Cache-Status', 'HIT');
       res.setHeader('X-Cache-Count', String(cached.length));
+      res.setHeader('X-Source', 'cache');
       return res.json(cached.filter(d => d.payment_date >= fromDate));
     }
     res.setHeader('X-Cache-Status', 'MISS');
   }
 
-  // B3 + Yahoo em paralelo
-  const [b3Result, yahooResult] = await Promise.allSettled([
-    fetchB3(symbol),
-    fetchYahoo(symbol)
-  ]);
+  // Chama endpoint correto conforme tipo do ativo
+  let dividends = [];
+  let source = 'none';
 
-  const b3Data    = b3Result.status    === 'fulfilled' ? b3Result.value    : [];
-  const yahooData = yahooResult.status === 'fulfilled' ? yahooResult.value : [];
-
-  const dividends = mergeDividends(b3Data, yahooData);
-
-  const source = b3Data.length && yahooData.length ? 'B3+Yahoo'
-               : b3Data.length    ? 'B3'
-               : yahooData.length ? 'Yahoo'
-               : 'none';
+  try {
+    if (isFII(symbol)) {
+      dividends = await fetchB3FII(symbol);
+      source = 'B3-FII';
+    } else {
+      dividends = await fetchB3Acao(symbol);
+      source = 'B3-Acao';
+    }
+  } catch (err) {
+    // Se o endpoint principal falhar, tenta o outro como último recurso
+    try {
+      if (isFII(symbol)) {
+        dividends = await fetchB3Acao(symbol);
+        source = 'B3-Acao-fallback';
+      } else {
+        dividends = await fetchB3FII(symbol);
+        source = 'B3-FII-fallback';
+      }
+    } catch (err2) {
+      console.error('B3 ambos endpoints falharam:', symbol, err.message, err2.message);
+      return res.json([]);
+    }
+  }
 
   res.setHeader('X-Source',      source);
   res.setHeader('X-Cache-Count', String(dividends.length));

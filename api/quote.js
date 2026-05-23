@@ -80,7 +80,32 @@ export default async function handler(req, res) {
 
   if (!symbol) return res.status(400).json({ error: 'symbol obrigatório' });
 
-  const symbols = symbol.split(',').map(s => s.trim()).filter(Boolean);
+  // Mapeamento de símbolos que o Yahoo não reconhece no formato padrão
+  const SYMBOL_MAP = {
+    // Cripto → sufixo -USD obrigatório no Yahoo Finance
+    'BNB':  'BNB-USD',
+    'SOL':  'SOL-USD',
+    'DOT':  'DOT-USD',
+    'HNT':  'HNT-USD',
+    'SAND': 'SAND-USD',
+    'BTC':  'BTC-USD',
+    'ETH':  'ETH-USD',
+    'ADA':  'ADA-USD',
+    'MATIC':'MATIC-USD',
+    'AVAX': 'AVAX-USD',
+    'LINK': 'LINK-USD',
+    'UNI':  'UNI-USD',
+    'ATOM': 'ATOM-USD',
+    'XRP':  'XRP-USD',
+    // Ações com ponto → traço
+    'BRK.B': 'BRK-B',
+    'BRK.A': 'BRK-A',
+  };
+
+  const symbols = symbol.split(',').map(s => {
+    const upper = s.trim().toUpperCase();
+    return SYMBOL_MAP[upper] || s.trim();
+  }).filter(Boolean);
   debugInfo.symbolsCount = symbols.length;
 
   const redisUrl   = process.env.UPSTASH_REDIS_REST_URL;

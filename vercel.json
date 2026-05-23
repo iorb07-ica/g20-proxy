@@ -1,3 +1,12 @@
 {
-  "version": 2
+  "version": 2,
+  "rewrites": [
+    { "source": "/api/dividends-br",    "destination": "/api/dividends?_src=br" },
+    { "source": "/api/provents-si",     "destination": "/api/dividends?_src=si" },
+    { "source": "/api/history-br",      "destination": "/api/history?_src=br" },
+    { "source": "/api/history-date",    "destination": "/api/history?_src=date" },
+    { "source": "/api/history-monthly", "destination": "/api/history?_src=monthly" },
+    { "source": "/api/splits",          "destination": "/api/corporate-actions?_src=splits" },
+    { "source": "/api/bonuses",         "destination": "/api/corporate-actions?_src=bonuses" }
+  ]
 }

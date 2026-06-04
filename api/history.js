@@ -65,7 +65,8 @@ function computeRefs(hist) {
   };
 }
 
-async function fetchYahooDaily(ticker, attempt = 0) {
+// Busca a série DIÁRIA crua (~6 anos) — base para refs (mensal/refs) e para _src=daily
+async function fetchYahooDailyHist(ticker, attempt = 0) {
   const now  = Math.floor(Date.now() / 1000);
   const from = now - 6 * 365 * 86400;
   const urls = [
@@ -76,7 +77,7 @@ async function fetchYahooDaily(ticker, attempt = 0) {
     try {
       const r = await fetch(url, { headers: YAHOO_HEADERS });
       if (!r.ok) {
-        if (r.status === 429 && attempt < 2) { await sleep(500 * (attempt + 1)); return fetchYahooDaily(ticker, attempt + 1); }
+        if (r.status === 429 && attempt < 2) { await sleep(500 * (attempt + 1)); return fetchYahooDailyHist(ticker, attempt + 1); }
         continue;
       }
       const data   = await r.json();
@@ -91,11 +92,17 @@ async function fetchYahooDaily(ticker, attempt = 0) {
         hist.push({ date: d.toISOString().split('T')[0], close: closes[i], dow: d.getDay() });
       });
       hist.sort((a, b) => a.date.localeCompare(b.date));
-      if (hist.length >= 5) return computeRefs(hist);
+      if (hist.length >= 5) return hist;
     } catch {}
   }
-  if (attempt < 2) { await sleep(300 * (attempt + 1)); return fetchYahooDaily(ticker, attempt + 1); }
+  if (attempt < 2) { await sleep(300 * (attempt + 1)); return fetchYahooDailyHist(ticker, attempt + 1); }
   return null;
+}
+
+// Mantém comportamento original: refs (refSemana/ref30d/ref3m/ref6m/refYTD/ref5y)
+async function fetchYahooDaily(ticker, attempt = 0) {
+  const hist = await fetchYahooDailyHist(ticker, attempt);
+  return hist ? computeRefs(hist) : null;
 }
 
 async function fetchWithCache(ticker, cachePrefix) {
@@ -150,6 +157,31 @@ export default async function handler(req, res) {
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
+  }
+
+  // ── Histórico diário completo (série) ────────────────────────────────────
+  // Uso: /api/history?_src=daily&symbol=AAPL[&from=YYYY-MM-DD ou YYYY-MM]
+  // Retorna { symbol, prices: { 'YYYY-MM-DD': close } } — mesmo formato do mensal, granularidade diária.
+  if (_src === 'daily') {
+    const ticker = symbol.split(',')[0].trim();
+    const cacheKey = `hist:daily:${ticker.toUpperCase()}`;
+    let hist = await redisGet(cacheKey);
+    const cacheHit = !!hist;
+    if (!hist) {
+      hist = await fetchYahooDailyHist(ticker);
+      if (hist && hist.length) await redisSet(cacheKey, hist);
+    }
+    res.setHeader('X-Cache-Status', cacheHit ? 'HIT' : (redisUrl ? 'MISS' : 'DISABLED'));
+    if (!hist || !hist.length) return res.json({ symbol: ticker, prices: {} });
+    // filtro opcional por data inicial (aceita YYYY-MM-DD ou YYYY-MM) para reduzir payload
+    let cut = '';
+    if (from) cut = from.length === 7 ? from + '-01' : from;
+    const prices = {};
+    for (const p of hist) {
+      if (cut && p.date < cut) continue;
+      if (p.close > 0) prices[p.date] = +Number(p.close).toFixed(4);
+    }
+    return res.json({ symbol: ticker, prices });
   }
 
   // ── Histórico mensal ─────────────────────────────────────────────────────

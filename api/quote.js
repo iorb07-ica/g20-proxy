@@ -9,6 +9,8 @@
 // Decisão: removidos esses campos. Chip de estado do mercado e futuros US
 // passam a ser calculados/exibidos sem depender desses dados do Yahoo.
 
+import { aplicarCors } from './_cors.js';
+
 const CACHE_TTL = 300; // 5 minutos — cotações mudam frequente, não pode ser 24h
 
 // ────────────────────────────────────────────────────
@@ -69,10 +71,9 @@ async function redisSet(url, token, key, value, debugInfo) {
 }
 
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  // Porteiro: libera só origem do G20; responde preflight; bloqueia o resto.
+  if (aplicarCors(req, res, 'GET,OPTIONS')) return;
   res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count');
-  if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { symbol, debug } = req.query;
   const isDebug = debug === '1' || debug === 'true';

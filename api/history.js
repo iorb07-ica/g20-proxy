@@ -1,23 +1,132 @@
-// api/history.js — Vercel Serverless Function
-// Busca série histórica de um ativo via Yahoo Finance + cache Redis
-// Uso: /api/history?symbol=VALE3.SA&range=10y
-//      /api/history?symbol=USDBRL=X&range=10y&interval=1d
-// Debug: adicionar &debug=1
+// api/history.js — Consolidado (history + history-br + history-date + history-monthly) + modo RAW
 //
-// VERSÃO 1 (31/08/26): criado depois de corsproxy.io e allorigins caírem no
-// mesmo dia — o dashboard dependia dos dois para TODA série histórica
-// (carteira, IBOV, S&P500, câmbio), e ficou sem nenhuma.
+// Plataforma G20 (formato de refs, usado por Carteira G20, Minha Carteira e Game G20):
+//   default       → refs diárias US (refSemana, ref30d, ref3m, ref6m, refYTD, ref5y)
+//   _src=br       → refs diárias BR (.SA automático)          [rewrite de /api/history-br]
+//   _src=date     → preço em data específica                  [rewrite de /api/history-date]
+//   _src=monthly  → histórico mensal                          [rewrite de /api/history-monthly]
+//   _src=daily    → série diária crua
 //
-// A resposta é o JSON BRUTO do Yahoo (chart.result), de propósito: o
-// dashboard já sabe interpretar esse formato, e assim o mesmo parser serve
-// tanto para este endpoint quanto para os proxies públicos que continuam
-// como último recurso. Não inventar formato novo aqui.
+// Dashboard pessoal (formato bruto do Yahoo, chart.result):
+//   /api/history?symbol=VALE3.SA&range=10y[&interval=1d]   ou   _src=raw
+//
+// HISTÓRICO: em 31/08/26 este arquivo foi substituído só pelo modo RAW, o que apagou
+// as rotas da plataforma (colunas 1W/1M/3M/6M/YTD/5Y vazias, Game G20 sem preço base).
+// Esta versão junta as duas. NÃO substituir de novo por uma versão parcial.
 
 import { aplicarCors } from './_cors.js';
 
-// Série histórica muda uma vez por dia, no fechamento. 6h é folgado e derruba
-// muito a chamada ao Yahoo — 17 ativos numa sessão viram 17 leituras de cache.
-const CACHE_TTL = 21600; // 6 horas
+const CACHE_TTL_HIST = 3600; // 1 hora
+
+async function redisGet(key) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const tok = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !tok) return null;
+  try {
+    const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${tok}` } });
+    const d = await r.json();
+    if (!d || d.result == null) return null;
+    return JSON.parse(d.result);
+  } catch { return null; }
+}
+
+async function redisSet(key, value) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const tok = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !tok) return false;
+  try {
+    await fetch(`${url}/set/${encodeURIComponent(key)}?EX=${CACHE_TTL_HIST}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(value)
+    });
+    return true;
+  } catch { return false; }
+}
+
+const YAHOO_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  Accept: 'application/json',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function closest(hist, targetDate) {
+  const t = targetDate.toISOString().split('T')[0];
+  const candidates = hist.filter(p => p.date <= t);
+  return candidates.length ? candidates[candidates.length - 1] : null;
+}
+
+function computeRefs(hist) {
+  const now = new Date();
+  const d30 = new Date(now); d30.setDate(d30.getDate() - 30);
+  const d3m = new Date(now); d3m.setMonth(d3m.getMonth() - 3);
+  const d6m = new Date(now); d6m.setMonth(d6m.getMonth() - 6);
+  const dYTD = new Date(now.getFullYear() - 1, 11, 31);
+  const d5y = new Date(now); d5y.setFullYear(d5y.getFullYear() - 5);
+  const lastFri = [...hist].reverse().find(p => p.dow === 5) || null;
+  return {
+    refSemana: lastFri,
+    ref30d:    closest(hist, d30),
+    ref3m:     closest(hist, d3m),
+    ref6m:     closest(hist, d6m),
+    refYTD:    closest(hist, dYTD),
+    ref5y:     closest(hist, d5y),
+  };
+}
+
+// Busca a série DIÁRIA crua (~6 anos) — base para refs (mensal/refs) e para _src=daily
+async function fetchYahooDailyHist(ticker, attempt = 0) {
+  const now  = Math.floor(Date.now() / 1000);
+  const from = now - 6 * 365 * 86400;
+  const urls = [
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${from}&period2=${now}`,
+    `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${from}&period2=${now}`,
+  ];
+  for (const url of urls) {
+    try {
+      const r = await fetch(url, { headers: YAHOO_HEADERS });
+      if (!r.ok) {
+        if (r.status === 429 && attempt < 2) { await sleep(500 * (attempt + 1)); return fetchYahooDailyHist(ticker, attempt + 1); }
+        continue;
+      }
+      const data   = await r.json();
+      const result = data?.chart?.result?.[0];
+      if (!result) continue;
+      const tss    = result.timestamp || [];
+      const closes = result.indicators?.quote?.[0]?.close || [];
+      const hist   = [];
+      tss.forEach((ts, i) => {
+        if (closes[i] == null) return;
+        const d = new Date(ts * 1000);
+        hist.push({ date: d.toISOString().split('T')[0], close: closes[i], dow: d.getDay() });
+      });
+      hist.sort((a, b) => a.date.localeCompare(b.date));
+      if (hist.length >= 5) return hist;
+    } catch {}
+  }
+  if (attempt < 2) { await sleep(300 * (attempt + 1)); return fetchYahooDailyHist(ticker, attempt + 1); }
+  return null;
+}
+
+// Mantém comportamento original: refs (refSemana/ref30d/ref3m/ref6m/refYTD/ref5y)
+async function fetchYahooDaily(ticker, attempt = 0) {
+  const hist = await fetchYahooDailyHist(ticker, attempt);
+  return hist ? computeRefs(hist) : null;
+}
+
+async function fetchWithCache(ticker, cachePrefix) {
+  const cacheKey = `${cachePrefix}${ticker.toUpperCase()}`;
+  const cached = await redisGet(cacheKey);
+  if (cached) return { data: cached, cacheHit: true };
+  const data = await fetchYahooDaily(ticker);
+  if (data) await redisSet(cacheKey, data);
+  return { data, cacheHit: false };
+}
+
+// ════════════════ MODO RAW (dashboard pessoal) ════════════════
+const RAW_CACHE_TTL = 21600; // 6 horas
 
 const RANGES   = ['1d','5d','1mo','3mo','6mo','1y','2y','5y','10y','ytd','max'];
 const INTERVALS = ['1d','1wk','1mo'];
@@ -25,7 +134,7 @@ const INTERVALS = ['1d','1wk','1mo'];
 // ────────────────────────────────────────────────────
 // Upstash REST API — mesmo padrão do quote.js
 // ────────────────────────────────────────────────────
-async function redisGet(url, token, key) {
+async function rawRedisGet(url, token, key) {
   try {
     const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
       headers: { Authorization: `Bearer ${token}` }
@@ -43,7 +152,7 @@ async function redisGet(url, token, key) {
   }
 }
 
-async function redisSet(url, token, key, value, debugInfo) {
+async function rawRedisSet(url, token, key, value, debugInfo) {
   try {
     const serialized = JSON.stringify(value);
     if (debugInfo) debugInfo.saveSize = serialized.length;
@@ -62,7 +171,7 @@ async function redisSet(url, token, key, value, debugInfo) {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify([
-        ['SET', key, serialized, 'EX', String(CACHE_TTL)]
+        ['SET', key, serialized, 'EX', String(RAW_CACHE_TTL)]
       ])
     });
 
@@ -84,10 +193,9 @@ async function redisSet(url, token, key, value, debugInfo) {
   }
 }
 
-export default async function handler(req, res) {
-  // Porteiro: libera só origem do G20; responde preflight; bloqueia o resto.
-  if (aplicarCors(req, res, 'GET,OPTIONS')) return;
-  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status');
+// Modo RAW (criado em 31/08/26 para o dashboard pessoal): devolve o JSON bruto do Yahoo.
+// Ativado quando a chamada traz range, interval ou _src=raw. A plataforma G20 nunca envia esses parâmetros.
+async function handleRaw(req, res) {
 
   const { symbol, range, interval, debug } = req.query;
   const isDebug = debug === '1' || debug === 'true';
@@ -169,7 +277,7 @@ export default async function handler(req, res) {
   const cacheKey = `history:v1:${sym}:${rng}:${itv}`;
 
   if (redisUrl && redisToken) {
-    const cached = await redisGet(redisUrl, redisToken, cacheKey);
+    const cached = await rawRedisGet(redisUrl, redisToken, cacheKey);
     if (cached && cached.chart) {
       debugInfo.steps.push('cache hit');
       res.setHeader('X-Cache-Status', 'HIT');
@@ -188,10 +296,141 @@ export default async function handler(req, res) {
   }
 
   if (redisUrl && redisToken) {
-    await redisSet(redisUrl, redisToken, cacheKey, data, isDebug ? debugInfo : null);
+    await rawRedisSet(redisUrl, redisToken, cacheKey, data, isDebug ? debugInfo : null);
   }
 
   res.setHeader('X-Cache-Status', redisUrl ? 'MISS' : 'DISABLED');
   if (isDebug) return res.json({ _debug: debugInfo, ...data });
   return res.json(data);
+}
+
+
+// ════════════════ PLATAFORMA G20 ════════════════
+export default async function handler(req, res) {
+  // Porteiro: libera só origem do G20; responde preflight; bloqueia o resto.
+  if (aplicarCors(req, res, 'GET,OPTIONS')) return;
+  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count');
+
+  const { symbol, from, date, _src } = req.query;
+
+  // Dashboard pessoal (formato bruto do Yahoo): só quando pedir range/interval ou _src=raw
+  if (_src === 'raw' || req.query.range || req.query.interval) return handleRaw(req, res);
+
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  if (!symbol) return res.status(400).json({ error: 'symbol obrigatorio' });
+
+  const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
+
+  // ── Histórico por data específica ────────────────────────────────────────
+  if (_src === 'date') {
+    if (!date) return res.status(400).json({ error: 'date obrigatório para _src=date' });
+    const targetDate = new Date(date + 'T12:00:00Z');
+    const period1 = Math.floor((targetDate.getTime() - 7 * 86400000) / 1000);
+    const period2 = Math.floor((targetDate.getTime() + 2 * 86400000) / 1000);
+
+    const fetchDate = async (baseUrl) => {
+      const r = await fetch(baseUrl, { headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' } });
+      const d  = await r.json();
+      const result = d?.chart?.result?.[0];
+      if (!result) return null;
+      const tss    = result.timestamp || [];
+      const closes = result.indicators?.quote?.[0]?.close || [];
+      const targetTs = Math.floor(targetDate.getTime() / 1000);
+      let bestIdx = -1, bestTs = -Infinity;
+      tss.forEach((ts, i) => { if (ts <= targetTs + 86400 && ts > bestTs && closes[i] != null) { bestTs = ts; bestIdx = i; } });
+      if (bestIdx === -1) return null;
+      return { close: closes[bestIdx], date: new Date(tss[bestIdx] * 1000).toISOString().split('T')[0], symbol };
+    };
+
+    try {
+      const result = await fetchDate(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&period1=${period1}&period2=${period2}`);
+      if (result) return res.json(result);
+      const result2 = await fetchDate(`https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&period1=${period1}&period2=${period2}`);
+      return res.json(result2 || { close: null, date: null, error: 'sem dados' });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── Histórico diário completo (série) ────────────────────────────────────
+  // Uso: /api/history?_src=daily&symbol=AAPL[&from=YYYY-MM-DD ou YYYY-MM]
+  // Retorna { symbol, prices: { 'YYYY-MM-DD': close } } — mesmo formato do mensal, granularidade diária.
+  if (_src === 'daily') {
+    const ticker = symbol.split(',')[0].trim();
+    const cacheKey = `hist:daily:${ticker.toUpperCase()}`;
+    let hist = await redisGet(cacheKey);
+    const cacheHit = !!hist;
+    if (!hist) {
+      hist = await fetchYahooDailyHist(ticker);
+      if (hist && hist.length) await redisSet(cacheKey, hist);
+    }
+    res.setHeader('X-Cache-Status', cacheHit ? 'HIT' : (redisUrl ? 'MISS' : 'DISABLED'));
+    if (!hist || !hist.length) return res.json({ symbol: ticker, prices: {} });
+    // filtro opcional por data inicial (aceita YYYY-MM-DD ou YYYY-MM) para reduzir payload
+    let cut = '';
+    if (from) cut = from.length === 7 ? from + '-01' : from;
+    const prices = {};
+    for (const p of hist) {
+      if (cut && p.date < cut) continue;
+      if (p.close > 0) prices[p.date] = +Number(p.close).toFixed(4);
+    }
+    return res.json({ symbol: ticker, prices });
+  }
+
+  // ── Histórico mensal ─────────────────────────────────────────────────────
+  if (_src === 'monthly') {
+    const fromDate = from ? new Date(from + '-01') : new Date(new Date().setFullYear(new Date().getFullYear() - 10));
+    const period1  = Math.floor(fromDate.getTime() / 1000);
+    const period2  = Math.floor(Date.now() / 1000);
+
+    let data = null;
+    for (const q of ['query1','query2']) {
+      try {
+        const r = await fetch(`https://${q}.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1mo&period1=${period1}&period2=${period2}`, {
+          headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' }
+        });
+        if (r.ok) { data = await r.json(); break; }
+      } catch {}
+    }
+    if (!data) return res.json({ symbol, prices: {} });
+    const result = data?.chart?.result?.[0];
+    if (!result) return res.json({ symbol, prices: {} });
+    const timestamps = result.timestamp || [];
+    const closes     = result.indicators?.quote?.[0]?.close || [];
+    const prices     = {};
+    timestamps.forEach((ts, i) => {
+      if (closes[i] == null || closes[i] <= 0) return;
+      const d   = new Date(ts * 1000);
+      const key = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+      prices[key] = +closes[i].toFixed(4);
+    });
+    return res.json({ symbol, prices });
+  }
+
+  // ── Histórico diário BR ou US ────────────────────────────────────────────
+  const isBR        = _src === 'br';
+  const cachePrefix = isBR ? 'hist:br:' : 'hist:us:';
+  const tickers     = symbol.split(',').map(s => s.trim()).filter(Boolean);
+
+  if (tickers.length === 1) {
+    const ticker = isBR && !tickers[0].endsWith('.SA') ? tickers[0] + '.SA' : tickers[0];
+    const { data, cacheHit } = await fetchWithCache(ticker, cachePrefix);
+    res.setHeader('X-Cache-Status', cacheHit ? 'HIT' : (redisUrl ? 'MISS' : 'DISABLED'));
+    if (!data) return res.json({ error: 'sem dados', symbol: tickers[0] });
+    return res.json({ symbol: tickers[0], ...data });
+  }
+
+  const results = {};
+  let hits = 0;
+  await Promise.all(tickers.map(async t => {
+    const ticker = isBR && !t.endsWith('.SA') ? t + '.SA' : t;
+    const { data, cacheHit } = await fetchWithCache(ticker, cachePrefix);
+    if (data) { results[t] = data; if (cacheHit) hits++; }
+  }));
+
+  res.setHeader('X-Cache-Status', hits === tickers.length ? 'HIT' : (hits > 0 ? 'PARTIAL' : (redisUrl ? 'MISS' : 'DISABLED')));
+  res.setHeader('X-Cache-Count', String(hits));
+  return res.json(results);
 }

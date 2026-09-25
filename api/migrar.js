@@ -36,6 +36,16 @@ if (!admin.apps.length) {
 
 function erro(status, msg) { const e = new Error(msg); e.status = status; return e; }
 
+// Cabeçalhos iguais aos que a própria página antiga envia (algumas APIs
+// recusam pedidos que não parecem vir do navegador).
+const CABECALHOS = {
+  'Accept': 'application/json, text/plain, */*',
+  'Content-Type': 'application/json',
+  'Origin': 'https://valorize.herokuapp.com',
+  'Referer': 'https://valorize.herokuapp.com/',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36',
+};
+
 async function comTempo(url, opts, ms) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), ms || 20000);
@@ -120,31 +130,60 @@ export default async function handler(req, res) {
     const senha = String(body.senha || '');
     if (!email || !senha) throw erro(400, 'Informe o e-mail e a senha da plataforma antiga.');
 
+    // Mesmo formato da tela de login antiga: { email, password }
     let token = null, mensagem = '';
-    for (const corpo of [{ email, password: senha }, { email, senha }]) {
-      const r = await comTempo(API_ANTIGA + '/login', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(corpo),
-      }, 25000).catch(() => null);
-      if (!r) continue;
+    const r = await comTempo(API_ANTIGA + '/login', {
+      method: 'POST', headers: CABECALHOS, body: JSON.stringify({ email, password: senha }),
+    }, 25000).catch(() => null);
+    if (r) {
       const j = await r.json().catch(() => ({}));
-      if (j && j.token) { token = j.token; break; }
-      mensagem = (j && (j.message || j.error)) || mensagem;
-    }
+      if (j && j.token) token = j.token;
+      else mensagem = (j && (j.message || j.error)) || ('status ' + r.status);
+    } else mensagem = 'sem resposta';
     if (!token) throw erro(401, 'Não foi possível entrar na plataforma antiga com esse e-mail e senha.' + (mensagem ? ' (' + mensagem + ')' : ''));
 
     // ── Carteira do aluno na plataforma antiga ──
     const rw = await comTempo(API_ANTIGA + '/wallet/transactions/false/all', {
-      headers: { Authorization: 'Bearer ' + token },
+      headers: { ...CABECALHOS, Authorization: 'Bearer ' + token },
     }, 30000).catch(() => null);
     if (!rw || !rw.ok) throw erro(502, 'A plataforma antiga não respondeu. Tente de novo em instantes.');
     const dados = await rw.json().catch(() => ({}));
     const todos = Object.values((dados && dados.wallet) || {}).flat();
 
-    const resumo = { total: todos.length, compras: 0, vendas: 0, proventos: 0, eventos: 0, excluidos: 0, invalidos: 0 };
+    // Ativos com grupamento (G) ou desdobramento (S): na plataforma antiga, a compra
+    // original desses ativos fica marcada como "inativa" e o evento passa a representá-la.
+    // Essas compras NÃO foram excluídas pelo aluno: importamos a compra original e a
+    // Minha Carteira aplica o evento sozinha (como faz com qualquer compra antiga).
+    // Cada evento preserva o valor total da compra que ele substituiu
+    // (ex.: 30 × 2,94 = 88,20 → grupamento 3 × 29,40 = 88,20). Usamos isso para
+    // ligar a compra inativa ao seu evento; inativa SEM evento correspondente
+    // é compra excluída pelo aluno e fica de fora.
+    const eventos = [];
+    todos.forEach(x => {
+      const t = String(x.type || '').toUpperCase();
+      if ((t === 'G' || t === 'S') && x.inactive !== true) {
+        eventos.push({ ativo: String(x.idStock || x.symbol), total: Math.abs(num(x.total)), usado: false });
+      }
+    });
+    function ligadaAEvento(x) {
+      const ativo = String(x.idStock || x.symbol);
+      const total = Math.abs(num(x.total)) || Math.abs(num(x.amount) * num(x.price));
+      const ev = eventos.find(e => !e.usado && e.ativo === ativo && total > 0 &&
+                                   Math.abs(e.total - total) <= Math.max(0.05, total * 0.005));
+      if (ev) { ev.usado = true; return true; }
+      return false;
+    }
+
+    const resumo = { total: todos.length, compras: 0, vendas: 0, proventos: 0, eventos: 0, excluidos: 0, invalidos: 0, ajustadasPorEvento: 0 };
     const itens = [];
     todos.forEach(x => {
       const tipoOp = String(x.type || '').toUpperCase();
-      if (x.inactive === true || x.executed === false) { resumo.excluidos++; return; }
+      if (x.executed === false) { resumo.excluidos++; return; }
+      if (x.inactive === true) {
+        const ajustada = (tipoOp === 'C' || tipoOp === 'V') && ligadaAEvento(x);
+        if (!ajustada) { resumo.excluidos++; return; }
+        resumo.ajustadasPorEvento++;
+      }
       if (tipoOp === 'D' || tipoOp === 'J' || tipoOp === 'R') { resumo.proventos++; return; }
       if (tipoOp !== 'C' && tipoOp !== 'V') { resumo.eventos++; return; }
 

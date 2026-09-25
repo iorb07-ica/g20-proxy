@@ -29,7 +29,7 @@ export function aplicarCors(req, res, metodos = 'GET,OPTIONS') {
   }
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', metodos);
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization'); // Authorization: token de login (ai-import)
 
   // Preflight (o browser pergunta "posso?") — responde e encerra.
   if (req.method === 'OPTIONS') {

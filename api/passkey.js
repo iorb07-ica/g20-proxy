@@ -209,10 +209,15 @@ export default async function handler(req, res) {
 
     // ── 3. Login: opções (não exige login; não grava nada) ───────────────────
     if (acao === 'login-opcoes') {
+      // Se o aparelho informar qual é a sua chave (credId), o pedido já sai
+      // direcionado a ela: o iPhone pula a janela "Usar chave-senha" e vai
+      // direto ao Face ID. O id da chave não é segredo (é só um identificador).
+      const credId = typeof body.credId === 'string' && /^[A-Za-z0-9_-]{16,512}$/.test(body.credId) ? body.credId : null;
       const options = await generateAuthenticationOptions({
         rpID: RP_ID,
         userVerification: 'required',
         timeout: 60000,
+        allowCredentials: credId ? [{ id: credId, transports: ['internal', 'hybrid'] }] : [],
       });
       const desafio = assinarDesafio({ tipo: 'login', c: options.challenge, exp: Date.now() + VALIDADE_MS });
       return res.status(200).json({ options, desafio });

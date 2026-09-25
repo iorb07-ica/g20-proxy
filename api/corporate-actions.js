@@ -70,7 +70,10 @@ export default async function handler(req, res) {
   const sym = (symbol || '');
   if (!sym) return res.status(400).json({ error: 'symbol obrigatório' });
 
-  const cacheKey = `splits-v2:${sym}`;
+  // v3: o cache guarda o HISTÓRICO COMPLETO do ativo (desde 2000). Antes guardava só
+  // os eventos a partir da data do primeiro aluno que consultou, e alunos com compras
+  // mais antigas deixavam de receber eventos antigos (ex.: desdobramento da PRIO3 em 2021).
+  const cacheKey = `splits-v3:${sym}`;
   if (redisUrl && redisToken) {
     const cached = await redisGet(redisUrl, redisToken, cacheKey);
     if (cached && Array.isArray(cached)) {
@@ -81,7 +84,7 @@ export default async function handler(req, res) {
     res.setHeader('X-Cache-Status', 'MISS');
   }
 
-  const startTs = from ? Math.floor(new Date(from).getTime() / 1000) : 978307200;
+  const startTs = 946684800; // 2000-01-01: sempre o histórico completo (o recorte por "from" é feito na resposta)
   const endTs   = Math.floor(Date.now() / 1000);
 
   try {

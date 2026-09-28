@@ -1,4 +1,5 @@
 // api/dividends.js — Consolidado (substitui dividends.js + dividends-br.js + provents-si.js)
+import { aplicarCors } from './_cors.js';
 // Routing via _src query param (injetado pelo vercel.json rewrite):
 //   _src=si  (ou default BR)  → Statusinvest + B3 fallback
 //   _src=br                   → B3 direto
@@ -179,11 +180,11 @@ async function fetchStatusinvest(symbol, assetType) {
 
 // ── HANDLER ───────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  // Porteiro de origem: só o site do G20 pode chamar (evita que qualquer
+  // site consuma a cota do proxy). Responde o preflight e bloqueia o resto.
+  if (aplicarCors(req, res, 'GET,OPTIONS')) return;
   res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status, X-Cache-Count, X-Future-Count, X-Source');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  if (req.method === 'OPTIONS') return res.status(200).end();
 
   let { symbol, from, _src, debug } = req.query;
   const isDebug = debug === '1';

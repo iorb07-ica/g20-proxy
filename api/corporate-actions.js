@@ -1,4 +1,5 @@
 // api/corporate-actions.js — Consolida splits.js + bonuses.js
+import { aplicarCors } from './_cors.js';
 // Routing via _src:
 //   _src=splits  → desdobramentos, grupamentos, bonificações (Yahoo Finance)
 //   _src=bonuses → bonificações DadosMercado
@@ -42,11 +43,11 @@ function classifyEvent(numerator, denominator, ratio) {
 }
 
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  // Porteiro de origem: só o site do G20 pode chamar (evita que qualquer
+  // site consuma a cota do proxy). Responde o preflight e bloqueia o resto.
+  if (aplicarCors(req, res, 'GET,OPTIONS')) return;
   res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status');
   res.setHeader('Cache-Control', 'no-store');
-  if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { symbol, ticker, from, _src } = req.query;
   const redisUrl   = process.env.UPSTASH_REDIS_REST_URL;

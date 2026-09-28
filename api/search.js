@@ -1,11 +1,23 @@
 // Proxy busca de ativos — Yahoo Finance search
 // GET /api/search?q=apple ou /api/search?q=PETR
 
+// Mesma lista de origens do _cors.js (replicada porque este arquivo é CommonJS
+// e o _cors.js é ESM). Só o site do G20 pode chamar, para não deixar qualquer
+// site consumir a cota do proxy.
+const ORIGENS_PERMITIDAS = [
+  'https://iorb07-ica.github.io',
+  'http://localhost:3000',
+  'http://127.0.0.1:5500',
+];
+
 module.exports = async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin || '';
+  if (ORIGENS_PERMITIDAS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Cache-Control', 's-maxage=3600');
   if (req.method === 'OPTIONS') return res.status(200).end();
+  if (!ORIGENS_PERMITIDAS.includes(origin)) return res.status(403).json({ error: 'Origem não autorizada' });
 
   const { q } = req.query;
   if (!q || q.length < 1) return res.json({ results: [] });

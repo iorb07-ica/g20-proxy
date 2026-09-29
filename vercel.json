@@ -8,5 +8,8 @@
     { "source": "/api/history-monthly", "destination": "/api/history?_src=monthly" },
     { "source": "/api/splits",          "destination": "/api/corporate-actions?_src=splits" },
     { "source": "/api/bonuses",         "destination": "/api/corporate-actions?_src=bonuses" }
+  ],
+  "crons": [
+    { "path": "/api/backup", "schedule": "0 6 * * 0" }
   ]
 }

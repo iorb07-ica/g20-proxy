@@ -1,4 +1,10 @@
-// api/rss.js — Proxy de RSS do G20Cast
+// api/rss.js — Proxy de RSS do G20Cast + busca de ativos (Yahoo)
+//
+// Une duas rotas antes separadas, para caber no limite de 12 funções do
+// plano Hobby da Vercel:
+//   /api/rss              → feed do G20Cast (comportamento original)
+//   /api/search?q=...     → busca de ativos (via rewrite para ?_src=search)
+// As duas são dados públicos, sem login e sem dados de aluno.
 // Busca o feed do podcast (anchor.fm) no servidor, onde não há bloqueio de CORS,
 // e devolve o XML para o navegador com os headers de CORS liberados.
 //
@@ -26,6 +32,9 @@ const TTL_MS = 10 * 60 * 1000; // 10 minutos
 
 export default async function handler(req, res) {
   if (aplicarCors(req, res)) return; // bloqueou ou respondeu o preflight
+
+  // Rota de busca de ativos (antiga /api/search), chegando por rewrite.
+  if (req.query._src === 'search') return buscarAtivos(req, res);
 
   const alvo = (req.query.url && String(req.query.url)) || FEED_PADRAO;
 
@@ -70,4 +79,53 @@ export default async function handler(req, res) {
   } catch (e) {
     return res.status(502).json({ error: 'Falha ao buscar o feed', detail: String(e && e.message || e) });
   }
+}
+
+
+// ── Busca de ativos (Yahoo Finance) — antiga /api/search ────────────────────
+async function buscarAtivos(req, res) {
+  const q = req.query.q;
+  if (!q || String(q).length < 1) return res.json({ results: [] });
+  res.setHeader('Cache-Control', 's-maxage=3600');
+  try {
+    const url = 'https://query1.finance.yahoo.com/v1/finance/search?q=' + encodeURIComponent(q) + '&quotesCount=8&newsCount=0&listsCount=0';
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+      }
+    });
+    const d = await r.json();
+    const quotes = (d && d.quotes) || [];
+    const results = quotes
+      .filter(x => x.symbol && x.quoteType !== 'OPTION' && x.quoteType !== 'FUTURE')
+      .slice(0, 8)
+      .map(x => ({
+        symbol:   x.symbol,
+        name:     x.longname || x.shortname || x.symbol,
+        exchange: x.exchange || '',
+        type:     x.quoteType || '',
+        g20tipo:  detectTipo(x)
+      }));
+    return res.json({ results });
+  } catch (err) {
+    return res.status(500).json({ error: err.message, results: [] });
+  }
+}
+
+function detectTipo(q) {
+  const sym = q.symbol || '';
+  const type = (q.quoteType || '').toUpperCase();
+  const exch = (q.exchange || '').toUpperCase();
+  if (type === 'CRYPTOCURRENCY') return 'Cripto';
+  if (type === 'ETF') return 'ETF';
+  if (type === 'MUTUALFUND') return 'ETF';
+  if (/\d$/.test(sym) && (exch.includes('SAO') || exch === 'BZ')) {
+    if (sym.endsWith('11')) return 'FII';
+    return 'Acao';
+  }
+  const reits = ['O','SPG','VNQ','NNN','STAG','WPC','VICI','AMT','PLD','PSA','EXR','AVB','EQR'];
+  if (reits.includes(sym)) return 'REIT';
+  if (type === 'EQUITY') return 'Stock';
+  return 'Stock';
 }

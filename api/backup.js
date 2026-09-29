@@ -151,6 +151,20 @@ async function r2Delete(key) {
 
 // ── Handler ─────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
+  // CORS: libera só o site do G20 a chamar esta rota pelo navegador (o botão
+  // do admin). Sem isso, o navegador bloqueia a chamada e dá "Failed to fetch".
+  const ORIGENS_PERMITIDAS = [
+    'https://iorb07-ica.github.io',
+    'http://localhost:3000',
+    'http://127.0.0.1:5500',
+  ];
+  const origin = req.headers.origin || '';
+  if (ORIGENS_PERMITIDAS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
   // ── Porta 1: cron da Vercel (Bearer CRON_SECRET) ──────────────────────────
   const auth = String(req.headers.authorization || '');
   const segredo = process.env.CRON_SECRET || '';

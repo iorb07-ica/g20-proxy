@@ -7,7 +7,8 @@
     { "source": "/api/history-date",    "destination": "/api/history?_src=date" },
     { "source": "/api/history-monthly", "destination": "/api/history?_src=monthly" },
     { "source": "/api/splits",          "destination": "/api/corporate-actions?_src=splits" },
-    { "source": "/api/bonuses",         "destination": "/api/corporate-actions?_src=bonuses" }
+    { "source": "/api/bonuses",         "destination": "/api/corporate-actions?_src=bonuses" },
+    { "source": "/api/search",          "destination": "/api/rss?_src=search" }
   ],
   "crons": [
     { "path": "/api/backup", "schedule": "0 6 * * 0" }

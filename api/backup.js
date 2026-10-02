@@ -25,6 +25,12 @@
 
 import admin from 'firebase-admin';
 import { createHash, createHmac } from 'crypto';
+import { publicarRanking } from '../lib/game-ranking.js';
+
+// TAMBÉM: ranking do Game G20 (out/2026). Com ?job=ranking, esta rota não faz
+// backup: calcula e publica o placar do Game (lib/game-ranking.js). Mesmas duas
+// portas (cron diário da Vercel ou admin logado). Ficou aqui por causa do limite
+// de 12 funções da Vercel.
 
 // ── Firebase Admin (mesmo padrão das outras rotas) ──────────────────────────
 if (!admin.apps.length) {
@@ -187,6 +193,18 @@ export default async function handler(req, res) {
     }
   }
   if (!veioDoCron && !veioDoAdmin) return res.status(403).json({ error: 'Sem permissão' });
+
+  // ── Ranking do Game G20 (juiz automático) ─────────────────────────────────
+  if (String((req.query && req.query.job) || '') === 'ranking') {
+    try {
+      const r = await publicarRanking(admin);
+      console.log('[ranking] OK', JSON.stringify(r));
+      return res.status(200).json(r);
+    } catch (e) {
+      console.error('[ranking]', e);
+      return res.status(500).json({ error: 'Falha ao publicar o ranking: ' + (e.message || e) });
+    }
+  }
 
   try {
     const db = admin.firestore();

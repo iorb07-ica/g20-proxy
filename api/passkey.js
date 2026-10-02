@@ -22,6 +22,10 @@
 // push-notify). Não precisa criar nenhuma variável nova.
 //
 // Custo: zero. Roda no plano gratuito do Vercel; o Firestore usa poucas leituras/gravações.
+//
+// Também cuida do SELO DE APROVAÇÃO no login (ações selo-aprovacao, selo-aluno e
+// selo-sincronizar, out/2026). Ficou aqui porque o projeto está no limite de 12
+// funções da Vercel e esta já tinha o Firebase Admin e a checagem de token.
 
 import admin from 'firebase-admin';
 import crypto from 'crypto';
@@ -132,6 +136,36 @@ async function credenciaisDoAluno(db, uid) {
 
 function limparNome(nome) {
   return String(nome || 'Aparelho').replace(/[<>]/g, '').trim().slice(0, 60) || 'Aparelho';
+}
+
+// ─── Selo de aprovação no login (out/2026) ───────────────────────────────────
+// As Firestore Rules passam a exigir request.auth.token.aprovado == true para ler
+// o conteúdo da plataforma. Antes bastava estar logado: qualquer pessoa que
+// criasse uma conta (cadastro aberto) conseguia ler aulas, Carteira G20 e o
+// Networking direto do banco, mesmo sem ser aprovada.
+// O selo é uma "custom claim" do Firebase Auth: viaja dentro do token de login,
+// então as Rules conferem sem gastar leitura. A FONTE DA VERDADE continua sendo
+// users/{uid}.aprovado no Firestore: este servidor só COPIA esse valor para o
+// login (ninguém escolhe o próprio selo, nem o admin inventa um valor).
+async function seloDoCadastro(db, uid) {
+  const snap = await db.collection('users').doc(uid).get();
+  const d = snap.exists ? snap.data() : {};
+  return d.role === 'admin' || d.aprovado === true;
+}
+async function aplicarSelo(uid, aprovado) {
+  const u = await admin.auth().getUser(uid);
+  const atuais = u.customClaims || {};
+  if ((atuais.aprovado === true) === aprovado) return false;          // já está certo
+  await admin.auth().setCustomUserClaims(uid, Object.assign({}, atuais, { aprovado }));
+  // perdeu o acesso: derruba as sessões abertas (o token antigo ainda teria o selo)
+  if (!aprovado) { try { await admin.auth().revokeRefreshTokens(uid); } catch (e) {} }
+  return true;
+}
+async function exigirAdmin(db, req) {
+  const quem = await alunoDoToken(req);
+  const snap = await db.collection('users').doc(quem.uid).get();
+  if (!snap.exists || snap.data().role !== 'admin') throw erro(403, 'Apenas o admin.');
+  return quem;
 }
 
 // ─── Handler principal ───────────────────────────────────────────────────────
@@ -297,6 +331,44 @@ export default async function handler(req, res) {
       if (!snap.exists || snap.data().uid !== aluno.uid) throw erro(404, 'Aparelho não encontrado.');
       await ref.delete();
       return res.status(200).json({ ok: true });
+    }
+
+    // ── 7. Selo de aprovação do PRÓPRIO aluno (chamado pelo auth-guard) ──────
+    if (acao === 'selo-aprovacao') {
+      const aluno = await alunoDoToken(req);
+      const aprovado = await seloDoCadastro(db, aluno.uid);
+      const mudou = await aplicarSelo(aluno.uid, aprovado);
+      return res.status(200).json({ aprovado, mudou });
+    }
+
+    // ── 8. Admin: sincroniza o selo de UM aluno (após aprovar/bloquear) ──────
+    if (acao === 'selo-aluno') {
+      await exigirAdmin(db, req);
+      const uid = String(body.uid || '');
+      if (!/^[A-Za-z0-9_-]{6,128}$/.test(uid)) throw erro(400, 'Aluno inválido.');
+      const aprovado = await seloDoCadastro(db, uid);
+      let mudou = false;
+      try { mudou = await aplicarSelo(uid, aprovado); }
+      catch (e) { if (e && e.code === 'auth/user-not-found') throw erro(404, 'Login do aluno não encontrado.'); throw e; }
+      return res.status(200).json({ aprovado, mudou });
+    }
+
+    // ── 9. Admin: sincroniza TODOS, em lotes de 50 (o site chama em sequência) ─
+    if (acao === 'selo-sincronizar') {
+      await exigirAdmin(db, req);
+      let q = db.collection('users').orderBy(admin.firestore.FieldPath.documentId()).limit(50);
+      if (body.depois) q = q.startAfter(String(body.depois));
+      const snap = await q.get();
+      let atualizados = 0, aprovados = 0, semLogin = 0;
+      for (const doc of snap.docs) {
+        const d = doc.data() || {};
+        const aprovado = d.role === 'admin' || d.aprovado === true;
+        if (aprovado) aprovados++;
+        try { if (await aplicarSelo(doc.id, aprovado)) atualizados++; }
+        catch (e) { if (e && e.code === 'auth/user-not-found') semLogin++; else throw e; }
+      }
+      const ultimo = snap.docs.length ? snap.docs[snap.docs.length - 1].id : null;
+      return res.status(200).json({ lidos: snap.docs.length, aprovados, atualizados, semLogin, proximo: snap.docs.length === 50 ? ultimo : null });
     }
 
     return res.status(400).json({ error: 'Ação desconhecida' });
